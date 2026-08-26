@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "veepee.fleet",
+  "name": "LLM Fleet",
+  "version": "0.1.0",
+  "author": "veepee",
+  "license": "MIT",
+  "description": "An activity light for self-hosted LLM servers: shows when your GPUs are actually doing work. Supports vLLM, Ollama, llama.cpp, SGLang and TGI.",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "Panel.qml" },
+  "barWidget": {
+    "displayName": "LLM Fleet",
+    "description": "Shows when your self-hosted LLM servers are generating tokens.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": { "servers": "", "refreshIntervalSec": 3 },
+    "schema": [
+      { "key": "servers", "type": "string", "label": "Servers: comma separated host, host:port, or host=Nickname", "defaultValue": "" },
+      { "key": "refreshIntervalSec", "type": "integer", "label": "Refresh interval (seconds)", "min": 1, "max": 60, "step": 1, "defaultValue": 3 }
+    ]
+  }
+}

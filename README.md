@@ -1,0 +1,167 @@
+# LLM Fleet
+
+An activity light for self-hosted LLM servers. It answers one question at a
+glance: **is anything actually generating right now?**
+
+![The panel, with three servers idle and one generating](preview.png)
+
+## Why
+
+If you run a model locally, you already know the feeling of not knowing. The fans
+spun up — is that the model, or a browser tab? A request has been sitting there
+for eight seconds — is it thinking, or did the server wedge? You kicked off a
+long job before dinner — did it finish, or die at minute two?
+
+Nothing on the desktop answers that. GPU telemetry tells you a card is warm,
+which is not the same as tokens being produced: a wedged server sits at 60°C
+looking exactly like a busy one. `nvidia-smi` in a spare terminal tells you about
+one machine, and only while you are looking at it.
+
+This puts the answer in the bar. The icon fills in when work is happening and
+empties when it stops. Open the panel and each server says what it is doing, with
+a live token count for the ones that publish one.
+
+Each row also says **what** the node is running, and whether it is struggling:
+the loaded model, KV cache pressure once it means something, and how many
+requests are queued behind the one being served. Those come from the same
+response the activity signal does — no extra request, no agent to install.
+
+It is deliberately **not** a dashboard, a controller, or a cost tracker. It does
+not start services, load models, change clocks, or bill anything, and it does
+not report temperatures, fan speeds or driver versions — those live on the
+*node*, not the inference server, and reading them would mean an agent on every
+host. GPU telemetry is a solved problem and other plugins solve it. This one
+answers the question they cannot: is inference actually happening, and with
+what.
+
+## Who it is for
+
+- **One model on the machine you are sitting at.** Ollama on `localhost` counts
+  as a fleet of one, and this is arguably where it earns its keep most: you are
+  using the same GPU you are inferencing on, and "is it busy right now" is a real
+  question with a real answer.
+- **A box under the desk, or several.** Point it at each one and the bar tells you
+  which is working without opening a terminal or an SSH session.
+- **A mixed setup.** vLLM on the big machine, Ollama on the little one, llama.cpp
+  on the laptop. Each is detected on its own terms.
+
+If you only use hosted APIs, this is not for you — there is nothing to watch.
+
+## What it supports
+
+| Runtime | Detected by | Activity signal | Verified |
+|---|---|---|---|
+| vLLM | `vllm:` series on `/metrics` | generated-token counter, plus running/queued requests | live |
+| SGLang | `sglang:` series on `/metrics` | generated-token counter, plus running/queued | from source |
+| llama.cpp | `llamacpp:` series on `/metrics` | predicted-token counter | from source |
+| TGI | `tgi_` series on `/metrics` | generated-token histogram, batch and queue size | from source |
+| Ollama | `/api/ps` | keep-alive expiry moving — see below | live |
+| OpenAI-compatible | `/v1/models` | none — reported as reachable only | live |
+
+**Ollama has no token counter.** There is no `/metrics` endpoint to read, so
+there is nothing that counts work. What it does expose is each resident model's
+keep-alive expiry, which is pushed forward every time the model is used, so a
+*change* in that value means the model was touched between two polls. That is a
+coarser signal than a token count and the panel does not pretend otherwise.
+
+**"llama.cpp shows nothing"** almost always means `llama-server` was started
+without `--metrics`. It serves no metrics endpoint unless asked to.
+
+## Install
+
+```sh
+omarchy plugin add https://github.com/vpontual/omarchy-fleet.git --enable
+```
+
+Then add the widget to your bar and tell it where your servers are.
+
+## Configure
+
+One setting, `servers` — a comma-separated list:
+
+```sh
+omarchy bar set veepee.fleet servers "localhost:11434, 10.0.0.5, gpu.local:8000"
+```
+
+A bare host is swept for the ports these runtimes normally use
+(`8000`, `11434`, `8080`, `30000`, `1234`) and the runtime is identified from
+what answers. Giving an explicit `host:port` skips the sweep.
+
+Name a server with `=` when its address is not memorable:
+
+```sh
+omarchy bar set veepee.fleet servers "10.0.0.5=Big Box, 10.0.0.6=Jetson, localhost:11434=This Laptop"
+```
+
+The name is shown beside the address rather than instead of it — a name you chose
+identifies the machine, but the address is what you need when it stops answering.
+
+| Setting | Default | Notes |
+|---|---|---|
+| `servers` | *(empty)* | `host`, `host:port`, or `host=Nickname` |
+| `refreshIntervalSec` | `3` | 1–60 |
+
+## What it runs on your machine
+
+Nothing privileged. **No `sudo` or `pkexec` is required, no package is
+installed, and no service is started or stopped.**
+
+Per configured server, per refresh, it runs `curl` against that server inside a
+small `bash` wrapper, reads the response and displays numbers from it. That is
+the whole of it.
+
+Once a server has been identified that is **one** request — `/metrics` for the
+metrics-bearing runtimes, `/api/ps` for Ollama. Until then it is a discovery
+sweep, and that is up to **fifteen**: five candidate ports
+(`8000`, `11434`, `8080`, `30000`, `1234`) times three endpoints. Giving an
+explicit `host:port` skips the sweep entirely, and so does a server that
+answers, because the port is remembered.
+
+The wrapper exists because Quickshell's output collector has no size limit of
+its own. It bounds the **whole script's** output at 64 KiB with `head -c` — one
+ceiling around everything, not one per branch, so no request can exceed it
+however the script grows — gives the whole call a 12-second deadline with
+`timeout`, and clears `BASH_ENV`/`ENV` so nothing is sourced on the way in.
+Every address is validated before it reaches that string, and everything drawn
+from a server's response is rendered as plain text, never as markup.
+
+## Removal
+
+```sh
+omarchy plugin remove veepee.fleet
+```
+
+Remove the widget from your bar first if you added it. Nothing is left behind —
+the plugin writes no files and installs nothing.
+
+## Troubleshooting
+
+```sh
+qs -p /usr/share/omarchy/shell ipc call veepee.fleet diagnostics
+```
+
+Reports every configured server, what was detected, and the last error. If a
+server shows as unreachable, the fastest check is whether the endpoint answers
+you directly:
+
+```sh
+curl -sSf http://YOUR_SERVER:8000/metrics | head
+```
+
+## Development
+
+```sh
+npm test                      # 51 tests, no dependencies
+omarchy plugin validate .
+```
+
+Pure logic lives in `Model.js` precisely so it is testable without a running
+shell — parsing, runtime adapters, ceilings and the activity maths. `Service.qml`
+does the probing, `Panel.qml` the drawing.
+
+Note that neither `npm test` nor `omarchy plugin validate` loads the QML, so a
+fatal QML error passes both. Check a real shell before believing a change works.
+
+## Licence
+
+MIT.

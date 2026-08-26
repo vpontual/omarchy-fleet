@@ -1,0 +1,7 @@
+{
+  "name": "omarchy-fleet",
+  "private": true,
+  "license": "MIT",
+  "description": "Test harness for the Omarchy fleet activity plugin. The plugin itself is QML and needs no build step.",
+  "scripts": { "test": "node --test \"test/*.test.js\"" }
+}
