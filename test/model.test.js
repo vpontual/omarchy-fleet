@@ -11,7 +11,7 @@ const source = fs.readFileSync(path.join(__dirname, "..", "Model.js"), "utf8")
 const Model = new Function(
   source +
     "; return { RUNTIMES, PORT_CANDIDATES, runtimeOf, detectFromMetrics, sumMetric," +
-    " readSample, activityBetween, fleetState, tokensPerSecond, isSafeHost, MAX_PROBE_BYTES, parseServers, stripLabel, MAX_LABEL, splitHostPort, PROBE_TIMEOUT_SEC, modelFromMetrics, shortModelName, avgMetric }"
+    " readSample, activityBetween, fleetState, isSafeHost, MAX_PROBE_BYTES, parseServers, stripLabel, MAX_LABEL, splitHostPort, PROBE_TIMEOUT_SEC, modelFromMetrics, shortModelName, avgMetric, clampField, stripControl, MAX_MESSAGE }"
 )()
 
 // Captured verbatim from a live vLLM node (DGX Spark), trimmed to the series
@@ -195,13 +195,6 @@ test("fleetState handles an empty fleet", () => {
   assert.equal(s.tokens, null)
 })
 
-test("tokensPerSecond guards a zero or missing interval", () => {
-  assert.equal(Model.tokensPerSecond(100, 2), 50)
-  assert.equal(Model.tokensPerSecond(100, 0), null)
-  assert.equal(Model.tokensPerSecond(100, -1), null)
-  assert.equal(Model.tokensPerSecond(null, 2), null)
-})
-
 // ── Host safety ───────────────────────────────────────────────────────
 
 test("isSafeHost accepts hosts and host:port, rejects anything shell-relevant", () => {
@@ -240,20 +233,18 @@ test("a runtime with no activity signal is flagged, not silently zeroed", () => 
 
 const SERVICE = fs.readFileSync(path.join(__dirname, "..", "Service.qml"), "utf8")
 
+// Probe.js is plain JS with no QML types, so it loads directly -- no source
+// extractor, no brace matching, no chance of an assertion matching a comment.
+const Probe = new Function(
+  fs.readFileSync(path.join(__dirname, "..", "Probe.js"), "utf8") +
+  "; return { script, parse }"
+)()
+
 function renderProbe(host, known) {
-  const src = SERVICE.slice(SERVICE.indexOf("function _probeScript"))
-  let depth = 0, i = src.indexOf("{"), seen = false
-  while (i < src.length) {
-    const c = src[i], n = src[i + 1]
-    if (c === "/" && n === "/") { const nl = src.indexOf("\n", i); i = nl === -1 ? src.length : nl; continue }
-    if (c === '"' || c === "'") { i++; while (i < src.length && src[i] !== c) i += src[i] === "\\" ? 2 : 1; i++; continue }
-    if (c === "/") { i++; while (i < src.length && src[i] !== "/") i += src[i] === "\\" ? 2 : 1; i++; continue }
-    if (c === "{") { depth++; seen = true }
-    else if (c === "}") { depth--; if (seen && depth === 0) { i++; break } }
-    i++
-  }
-  return new Function("Model", src.slice(0, i) + "; return _probeScript")(Model)(host, known)
+  // The REAL function, imported rather than scraped out of QML.
+  return Probe.script(Model, host, known)
 }
+
 
 // A body shaped like the real thing: the series the plugin needs sit far past
 // any fixed byte bound, behind a wall of histogram buckets.
@@ -376,10 +367,12 @@ test("the collector read is clamped as well as the probe", () => {
   // missing. The probe script is the real bound; this means no parser can be
   // handed more than the ceiling even if a future probe path forgets one --
   // which is exactly what happened to the known-node probe.
-  const reads = SERVICE.match(/String\(out \|\| ""\)[^\n]*/g) || []
-  assert.equal(reads.length, 1, `expected one collector read, saw ${reads.length}`)
-  assert.ok(reads[0].includes("slice(0, Model.MAX_PROBE_BYTES)"),
-    `the collector read is unclamped: ${reads[0].trim()}`)
+  // The clamp moved into Probe.parse, where it can be tested by calling it.
+  assert.equal(Probe.parse(Model, "PORT 8000\nRT vllm\n" + "x".repeat(200000),
+    Model.MAX_PROBE_BYTES).body.length <= Model.MAX_PROBE_BYTES, true,
+    "Probe.parse does not clamp what it is handed")
+  assert.ok(/Probe\.parse\(Model, out, Model\.MAX_PROBE_BYTES\)/.test(SERVICE),
+    "the collector read does not go through the clamped parser")
 })
 
 // ── Server nicknames ─────────────────────────────────────────────────
@@ -776,8 +769,9 @@ test("runtime prefixes are validated, not sanitised by a no-op", () => {
   // Both assertions run against CODE, never comments: extractFunction returns
   // the comments too, and the comment here quotes the very regex being checked
   // for -- so asserting against the raw body passed with the validation gone.
-  const body = extractFunction("_probeScript")
-  const code = body.split("\n").filter(l => !l.trim().startsWith("//")).join("\n")
+  // Read Probe.js itself now that the builder lives there.
+  const src = fs.readFileSync(path.join(__dirname, "..", "Probe.js"), "utf8")
+  const code = src.split("\n").filter(l => !l.trim().startsWith("//")).join("\n")
   assert.ok(!/replace\(\/:\/g/.test(code), "the no-op replace is back")
   assert.ok(/\^\[A-Za-z0-9_:\]\+\$/.test(code), "prefixes reach the shell unvalidated")
   assert.ok(/prefixes\[pi\]/.test(code), "nothing iterates the prefixes to validate them")
@@ -802,4 +796,181 @@ test("the settings label documents every form the parser accepts", () => {
   for (const form of ["host", "host:port", "host=Nickname"]) {
     assert.ok(label.includes(form), `the settings label omits ${form}: ${label}`)
   }
+})
+
+// ── The two blocking defects, which had tests that could not see them ──
+
+test("configError actually produces a message, not a thrown binding", () => {
+  // Model.clampField was CALLED by Service.qml and never defined in Model.js
+  // -- carried over from a sibling plugin from memory. The binding threw, QML
+  // left configError empty, and the bad-address message never appeared: the
+  // exact silent drop the feature exists to end.
+  //
+  // The old test asserted both halves of the wiring (the parser rejects, the
+  // panel reads the property) and never the function joining them. This
+  // evaluates the real expression.
+  assert.equal(typeof Model.clampField, "function", "Model.clampField does not exist")
+
+  const at = SERVICE.indexOf("readonly property string configError:")
+  assert.notEqual(at, -1, "the configError property could not be found")
+  const expr = SERVICE.slice(SERVICE.indexOf(":", at) + 1, SERVICE.indexOf("\n\n", at))
+
+  const evaluate = (rejected) => new Function("Model", "configured",
+    "return (" + expr.trim() + ")")(Model, { rejected: rejected })
+
+  assert.equal(evaluate([]), "", "an empty reject list must say nothing")
+  const one = evaluate(["host|x"])
+  assert.ok(one.length > 0 && one.includes("host|x"), `no message for one bad address: ${one}`)
+  const two = evaluate(["a|b", "c&d"])
+  assert.ok(two.includes("a|b") && two.includes("c&d"), `no message for two: ${two}`)
+  // And it must be clamped rather than unbounded.
+  const many = evaluate(Array.from({ length: 200 }, (_, i) => "bad|" + i))
+  assert.ok(many.length <= 200, `an unbounded error message: ${many.length} chars`)
+})
+
+test("no runtime can throw out of readSample, whatever a server returns", () => {
+  // `openai` has no work counter, so rt.work was null and sumMetric
+  // dereferenced it. That threw inside _finish BEFORE _pending was
+  // decremented, leaving `probing` true so every later refresh returned early
+  // -- the widget frozen on stale data, permanently, from one response body.
+  const hostile = [
+    '{"object":"list","data":[]}\nnull\n',
+    "null",
+    "null 1.0",
+    "",
+    "{",
+    "vllm:generation_tokens_total{} not-a-number",
+    "\n\n\n",
+    "x".repeat(5000)
+  ]
+  for (const runtime of Object.keys(Model.RUNTIMES)) {
+    for (const body of hostile) {
+      assert.doesNotThrow(() => Model.readSample(runtime, body),
+        `${runtime} threw on ${JSON.stringify(body.slice(0, 30))}`)
+    }
+  }
+  // The specific reachable case: an openai node on its second poll.
+  assert.equal(Model.readSample("openai", '{"object":"list","data":[]}\nnull\n'), null)
+})
+
+test("Probe.parse survives a hostile body and clamps the port", () => {
+  // parseInt on unbounded digits stringifies as "1e+30" straight back into the
+  // next URL.
+  assert.equal(Probe.parse(Model, "", 1000), null)
+  assert.equal(Probe.parse(Model, "   \n  ", 1000), null)
+  assert.equal(Probe.parse(Model, "nothing recognisable", 1000), null)
+
+  const ok = Probe.parse(Model, "PORT 8000\nRT vllm\nvllm:x 1", 1000)
+  assert.equal(ok.port, 8000)
+  assert.equal(ok.runtime, "vllm")
+
+  for (const bad of ["0", "65536", "99999999999999999999999999999999"]) {
+    const r = Probe.parse(Model, "PORT " + bad + "\nRT vllm\nvllm:x 1", 1000)
+    assert.equal(r.port, null, `port ${bad} was accepted`)
+  }
+})
+
+// ── Constants and QML-only defences, which no JS test could see ──────
+
+test("every Text that renders anything declares PlainText", () => {
+  // The README's headline safety claim, and NOTHING enforced it: deleting all
+  // seven declarations left the whole suite green. QML is parsed by no tool in
+  // this repo, so a Text added later is the defence most likely to be lost
+  // silently.
+  for (const file of ["Panel.qml", "FleetIcon.qml"]) {
+    const src = fs.readFileSync(path.join(__dirname, "..", file), "utf8")
+    const declared = (src.match(/\bText\s*\{/g) || []).length
+    const plain = (src.match(/textFormat:\s*Text\.PlainText/g) || []).length
+    assert.equal(plain, declared,
+      `${file}: ${declared} Text blocks but ${plain} declare PlainText`)
+    assert.ok(!/Text\.AutoText|Text\.RichText|Text\.StyledText/.test(src),
+      `${file} renders markup`)
+  }
+})
+
+test("the ceilings are sane values, not merely referenced ones", () => {
+  // The old assertions checked that the constant was USED. Raising
+  // MAX_PROBE_BYTES to a gigabyte or the timeout past the watchdog left the
+  // suite green, because "is it the shared constant" says nothing about
+  // whether the constant still means anything.
+  assert.equal(Model.MAX_PROBE_BYTES, 65536)
+  assert.ok(Model.MAX_PROBE_BYTES >= 4096 && Model.MAX_PROBE_BYTES <= 1048576,
+    "a ceiling this size is not a ceiling")
+
+  // The probe bound must fire before the 15s watchdog, with room to spare --
+  // 14 races it.
+  assert.ok(Model.PROBE_TIMEOUT_SEC <= 13,
+    `${Model.PROBE_TIMEOUT_SEC}s races the 15s watchdog`)
+  assert.ok(Model.PROBE_TIMEOUT_SEC >= 5, "too short to survive a slow first sweep")
+
+  // And each individual request stays bounded too.
+  const script = renderProbe("10.0.0.1", null)
+  assert.ok(/--max-time \d+/.test(script), "curl has no per-request time bound")
+  const t = parseInt(script.match(/--max-time (\d+)/)[1])
+  assert.ok(t >= 1 && t <= 10, `--max-time ${t} is not a bound`)
+})
+
+test("the runtime table and the port sweep cannot drift apart", () => {
+  // Two sources of one fact. PORT_CANDIDATES is a separate literal from the
+  // per-runtime `port` fields, kept in step by hand.
+  for (const key of Object.keys(Model.RUNTIMES)) {
+    const rt = Model.RUNTIMES[key]
+    if (!rt.port) continue
+    assert.ok(Model.PORT_CANDIDATES.indexOf(rt.port) !== -1,
+      `${key} defaults to port ${rt.port}, which the sweep never tries`)
+  }
+})
+
+test("avgMetric reads the value, not a trailing timestamp", () => {
+  // The Prometheus text format allows an optional timestamp after the value.
+  // Reading the LAST whitespace field turned "0.5 1700000000000" into 1.7e12,
+  // rendered as "170000000000000% cache". sumMetric, this function's near-twin,
+  // always read the first -- the two had drifted in the one line where they
+  // differ.
+  const stamped = 'vllm:kv_cache_usage_perc{model_name="m"} 0.5 1700000000000'
+  assert.equal(Model.avgMetric(stamped, "vllm:kv_cache_usage_perc"), 0.5)
+  assert.equal(Model.sumMetric(stamped, "vllm:kv_cache_usage_perc"), 0.5,
+    "the two readers must agree on where the value is")
+
+  // A gauge can never leave 0..1 and reach the panel as a percentage.
+  const body = [0.4, 0.6].map((v, i) =>
+    `vllm:kv_cache_usage_perc{engine="${i}"} ${v} 1700000000000`).join("\n")
+    + '\nvllm:generation_tokens_total{engine="0"} 5.0'
+  const cache = Model.readSample("vllm", body).cache
+  assert.ok(cache >= 0 && cache <= 1, `a fraction left its range: ${cache}`)
+  assert.equal(cache, 0.5)
+})
+
+test("the Ollama path takes the tail before clamping, like the metrics path", () => {
+  // Fixed for vLLM and still live here: hf.co/... names are ordinary in
+  // Ollama, and clamping first let the prefix eat the budget.
+  const body = JSON.stringify({ models: [{
+    name: "hf.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q4_K_M",
+    expires_at: "2026-01-01T00:00:00Z" }] })
+  const model = Model.readSample("ollama", body).model
+  assert.ok(!model.startsWith("hf.co"), `the vendor prefix survived: ${model}`)
+  assert.ok(model.startsWith("Qwen3-Coder"), `the tail was cut: ${model}`)
+  assert.ok(model.length <= Model.MAX_LABEL)
+
+  // Both paths must agree on the rule.
+  const viaMetrics = Model.modelFromMetrics(
+    'vllm:x{model_name="hf.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q4_K_M"} 0')
+  assert.equal(model, viaMetrics, "the two model paths disagree on shortening")
+})
+
+test("a detected node is cached even when no sample could be parsed", () => {
+  // Caching only on a successful sample meant a node that answered but yielded
+  // nothing usable was never remembered, so the full sweep -- five ports times
+  // three endpoints -- re-ran every refresh: five requests a second against
+  // that host, indefinitely, while the panel showed it reachable and idle.
+  const finish = extractFunction("_finish")
+  const code = finish.split("\n").filter(l => !l.trim().startsWith("//")).join("\n")
+  const at = code.indexOf("_state[host] = {")
+  assert.notEqual(at, -1, "the cache write could not be found")
+  // The write must not sit behind a sample check.
+  const before = code.slice(Math.max(0, at - 200), at)
+  assert.ok(!/if \(sample\)[^\n]*$/.test(before.trim()),
+    "the cache write is conditional on a sample again")
+  assert.ok(/sample: sample \|\| null/.test(code),
+    "the cached entry does not tolerate a missing sample")
 })

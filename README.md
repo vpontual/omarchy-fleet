@@ -56,7 +56,7 @@ If you only use hosted APIs, this is not for you — there is nothing to watch.
 | llama.cpp | `llamacpp:` series on `/metrics` | predicted-token counter | from source |
 | TGI | `tgi_` series on `/metrics` | generated-token histogram, batch and queue size | from source |
 | Ollama | `/api/ps` | keep-alive expiry moving — see below | live |
-| OpenAI-compatible | `/v1/models` | none — reported as reachable only | live |
+| OpenAI-compatible | `/v1/models` | none — reported as reachable only | n/a |
 
 **Ollama has no token counter.** There is no `/metrics` endpoint to read, so
 there is nothing that counts work. What it does expose is each resident model's
@@ -140,7 +140,7 @@ the plugin writes no files and installs nothing.
 qs -p /usr/share/omarchy/shell ipc call veepee.fleet diagnostics
 ```
 
-Reports every configured server, what was detected, and the last error. If a
+Reports every configured server, what was detected, and any address that was rejected. If a
 server shows as unreachable, the fastest check is whether the endpoint answers
 you directly:
 
@@ -151,13 +151,19 @@ curl -sSf http://YOUR_SERVER:8000/metrics | head
 ## Development
 
 ```sh
-npm test                      # 51 tests, no dependencies
+npm test                      # 59 tests, no dependencies
 omarchy plugin validate .
 ```
 
-Pure logic lives in `Model.js` precisely so it is testable without a running
-shell — parsing, runtime adapters, ceilings and the activity maths. `Service.qml`
-does the probing, `Panel.qml` the drawing.
+Pure logic lives in plain JavaScript precisely so it is testable without a
+running shell: `Model.js` holds the runtime adapters, Prometheus parsing,
+sampling and the activity maths, and `Probe.js` builds the probe command and
+reads what it prints back. `Service.qml` is the process pool, timers and IPC;
+`Panel.qml` draws.
+
+That split is not tidiness. Logic living in QML can only be reached by tests
+through a source extractor, and both of the worst defects found in review were
+in exactly that region — one a function that was called and never defined.
 
 Note that neither `npm test` nor `omarchy plugin validate` loads the QML, so a
 fatal QML error passes both. Check a real shell before believing a change works.

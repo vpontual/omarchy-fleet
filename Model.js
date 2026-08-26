@@ -12,13 +12,27 @@
 // catches it. Verified against a live server: one 2-token completion moved
 // vllm:generation_tokens_total from 48456 to 48458.
 
+var PROBE_TIMEOUT_SEC = 12
+
+// Hard ceiling on what any probe may hand back, applied in the shell BEFORE
+// the bytes reach QML.
+//
+// Quickshell's StdioCollector has no size limit of its own -- its whole API is
+// text/data/waitForEnd -- so whatever a probe emits is retained in full, in
+// the process that draws the entire desktop bar. The filtered reply from a
+// real vLLM node is ~478 bytes, so this is well over a hundred times the
+// headroom it needs; it exists for the server that answers with 11 MB of well-formed
+// matching series, not for the honest one. Measured: without it, exactly that
+// much reached the collector, every 3 seconds.
+var MAX_PROBE_BYTES = 65536
+
 // ── Runtime adapters ──────────────────────────────────────────────────
 //
 // Adding a runtime should be a data change, not a code change. Each adapter
 // says where to look and which series carries "work done so far".
 //
 // `probe` is the path to fetch. `filter` is an extended-regex handed to grep
-// at the fetch boundary, because a vLLM /metrics body is 54-66 KB and this
+// at the fetch boundary, because a vLLM /metrics body is ~68 kB and this
 // runs inside the process that hosts the whole desktop -- the shell should
 // never see the other 99.7%.
 // Seconds before a whole probe is killed outright.
@@ -28,20 +42,6 @@
 // refusing them therefore had no overall bound at all, and the 15s watchdog
 // only resets the plugin's own flags -- the processes carry on. This bounds
 // the whole sweep, and sits under that watchdog so it fires first.
-var PROBE_TIMEOUT_SEC = 12
-
-// Hard ceiling on what any probe may hand back, applied in the shell BEFORE
-// the bytes reach QML.
-//
-// Quickshell's StdioCollector has no size limit of its own -- its whole API is
-// text/data/waitForEnd -- so whatever a probe emits is retained in full, in
-// the process that draws the entire desktop bar. The filtered reply from a
-// real vLLM node is ~478 bytes, so this is three orders of magnitude of
-// headroom; it exists for the server that answers with 11 MB of well-formed
-// matching series, not for the honest one. Measured: without it, exactly that
-// much reached the collector, every 3 seconds.
-var MAX_PROBE_BYTES = 65536
-
 var RUNTIMES = {
   vllm: {
     label: "vLLM", port: 8000, probe: "/metrics", detect: "vllm:",
@@ -55,34 +55,7 @@ var RUNTIMES = {
     // how `verified` is used throughout this table.
     cache: "vllm:kv_cache_usage_perc",
     verified: "live"
-  },
-  sglang: {
-    label: "SGLang", port: 30000, probe: "/metrics", detect: "sglang:",
-    filter: "^sglang:(generation_tokens_total|num_running_reqs|num_queue_reqs)",
-    work: "sglang:generation_tokens_total",
-    running: "sglang:num_running_reqs",
-    waiting: "sglang:num_queue_reqs",
-    verified: "source"
-  },
-  llamacpp: {
-    label: "llama.cpp", port: 8080, probe: "/metrics", detect: "llamacpp:",
-    filter: "^llamacpp:(tokens_predicted_total|requests_processing|requests_deferred)",
-    work: "llamacpp:tokens_predicted_total",
-    running: "llamacpp:requests_processing",
-    waiting: "llamacpp:requests_deferred",
-    // llama-server only serves /metrics when started with --metrics.
-    verified: "source"
-  },
-  tgi: {
-    label: "TGI", port: 8080, probe: "/metrics", detect: "tgi_",
-    filter: "^tgi_(request_generated_tokens_sum|batch_current_size|queue_size)",
-    // A histogram, so the exposition emits _sum -- the monotonic total.
-    work: "tgi_request_generated_tokens_sum",
-    running: "tgi_batch_current_size",
-    waiting: "tgi_queue_size",
-    verified: "source"
-  },
-  ollama: {
+  },  ollama: {
     label: "Ollama", port: 11434, probe: "/api/ps", detect: null,
     filter: null,
     // No metrics endpoint exists, so there is no token counter. What Ollama
@@ -95,8 +68,30 @@ var RUNTIMES = {
     // against local time would be nonsense.
     work: null,
     verified: "live"
-  },
-  openai: {
+  },  llamacpp: {
+    label: "llama.cpp", port: 8080, probe: "/metrics", detect: "llamacpp:",
+    filter: "^llamacpp:(tokens_predicted_total|requests_processing|requests_deferred)",
+    work: "llamacpp:tokens_predicted_total",
+    running: "llamacpp:requests_processing",
+    waiting: "llamacpp:requests_deferred",
+    // llama-server only serves /metrics when started with --metrics.
+    verified: "source"
+  },  tgi: {
+    label: "TGI", port: 8080, probe: "/metrics", detect: "tgi_",
+    filter: "^tgi_(request_generated_tokens_sum|batch_current_size|queue_size)",
+    // A histogram, so the exposition emits _sum -- the monotonic total.
+    work: "tgi_request_generated_tokens_sum",
+    running: "tgi_batch_current_size",
+    waiting: "tgi_queue_size",
+    verified: "source"
+  },  sglang: {
+    label: "SGLang", port: 30000, probe: "/metrics", detect: "sglang:",
+    filter: "^sglang:(generation_tokens_total|num_running_reqs|num_queue_reqs)",
+    work: "sglang:generation_tokens_total",
+    running: "sglang:num_running_reqs",
+    waiting: "sglang:num_queue_reqs",
+    verified: "source"
+  },  openai: {
     label: "OpenAI-compatible", port: 1234, probe: "/v1/models", detect: null,
     filter: null,
     // LM Studio, KoboldCpp, oobabooga, TabbyAPI and friends expose no metrics
@@ -109,9 +104,19 @@ var RUNTIMES = {
   }
 }
 
-// Ports tried, in order, when the user gives a bare host. A refused port
-// answers in ~45ms, so the whole sweep costs about 0.2s and happens once.
-var PORT_CANDIDATES = [8000, 11434, 8080, 30000, 1234]
+// Derived from the runtime table, not written out again beside it.
+//
+// It used to be a second literal listing the same ports, kept in step with the
+// per-runtime defaults by hand and by one test. Two sources for one fact is a
+// drift waiting to happen; this has one.
+var PORT_CANDIDATES = (function () {
+  var seen = {}, out = []
+  for (var key in RUNTIMES) {
+    var port = RUNTIMES[key].port
+    if (port && !seen[port]) { seen[port] = true; out.push(port) }
+  }
+  return out
+})()
 
 // Identify a runtime from a /metrics body by its series prefix. This is what
 // lets the user enter an IP and nothing else: the prefix is unambiguous, and
@@ -138,17 +143,13 @@ function runtimeOf(name) {
 
 // ── Prometheus ────────────────────────────────────────────────────────
 
-// Sums every series sharing a metric name. vLLM emits one series per engine
-// and per model, so a multi-model node would otherwise report only whichever
-// line happened to be last.
-// The model a metrics-bearing runtime is serving, read from the labels already
-// present on the series we fetch. Free: no extra request, no extra endpoint.
+// The model a metrics-bearing runtime is serving, read from labels already
+// present on the series being fetched. Free: no extra request, no extra
+// endpoint.
 //
-// This string is chosen by whoever runs the server, so it is treated like any
-// other remote value -- stripped and clamped before it can reach a label in the
-// shared bar. A model id is also routinely a path ("Qwen/Qwen3.6-35B-A3B-FP8")
-// and the leading vendor segment is the least informative part when space is
-// short, so the tail is what survives.
+// The string is chosen by whoever runs the server, so it is treated like any
+// other remote value: tail first, then stripped and clamped, before it can
+// reach a label in the shared bar.
 function modelFromMetrics(body) {
   var match = String(body || "").match(/model_name="([^"]*)"/)
   if (!match) return ""
@@ -165,6 +166,17 @@ function shortModelName(name) {
   return slash === -1 ? text : text.slice(slash + 1)
 }
 
+// Sums every series sharing a metric name. vLLM emits one series per engine
+// and per model, so a multi-model node would otherwise report only whichever
+// line happened to be last.
+// The model a metrics-bearing runtime is serving, read from the labels already
+// present on the series we fetch. Free: no extra request, no extra endpoint.
+//
+// This string is chosen by whoever runs the server, so it is treated like any
+// other remote value -- stripped and clamped before it can reach a label in the
+// shared bar. A model id is also routinely a path ("Qwen/Qwen3.6-35B-A3B-FP8")
+// and the leading vendor segment is the least informative part when space is
+// short, so the tail is what survives.
 function sumMetric(text, metric) {
   var lines = String(text || "").split("\n")
   var total = null
@@ -190,9 +202,6 @@ function sumMetric(text, metric) {
 
 // ── Sampling ──────────────────────────────────────────────────────────
 
-// One reading from one node. `work` is a monotonic counter where the runtime
-// has one, or a token derived from Ollama's keep-alive expiry where it does
-// not. `null` means "this runtime cannot tell us", which is different from 0.
 // The MEAN of a series, for gauges rather than counters.
 //
 // sumMetric exists because vLLM emits one series per engine and per model, and
@@ -210,7 +219,12 @@ function avgMetric(text, metric) {
     if (line.indexOf(metric) !== 0) continue
     var rest = line.slice(metric.length)
     if (rest.charAt(0) !== "{" && rest.charAt(0) !== " ") continue
-    var value = parseFloat(rest.slice(rest.lastIndexOf(" ") + 1))
+    // The FIRST field after the labels, not the last. The Prometheus text
+    // format allows an optional timestamp after the value, and reading the last
+    // field turned "0.5 1700000000000" into 1.7e12 -- rendered as
+    // "170000000000000% cache". sumMetric, this function's near-twin, always
+    // read the first; the two had drifted in the one line where they differ.
+    var value = parseFloat(rest.replace(/^\{[^}]*\}/, "").trim().split(/\s+/)[0])
     if (isFinite(value)) values.push(value)
   }
   if (values.length === 0) return null
@@ -219,6 +233,9 @@ function avgMetric(text, metric) {
   return total / values.length
 }
 
+// One reading from one node. `work` is a monotonic counter where the runtime
+// has one, or a token derived from Ollama's keep-alive expiry where it does
+// not. `null` means "this runtime cannot tell us", which is different from 0.
 function readSample(runtimeName, body) {
   var rt = runtimeOf(runtimeName)
   if (!rt) return null
@@ -238,10 +255,20 @@ function readSample(runtimeName, body) {
     var token = ""
     for (var m = 0; m < models.length; m++) token += models[m].name + "@" + models[m].expires + ";"
     return { work: null, token: token, running: null, waiting: null,
-             cache: null, model: models.length ? stripLabel(models[0].name) : "",
+             // Tail FIRST, then clamp -- the same ordering the metrics path
+             // uses. Clamping first let a long prefix eat the budget, and
+             // "hf.co/unsloth/Qwen3-Coder-30B-..." is an ordinary Ollama name.
+             cache: null, model: models.length ? stripLabel(shortModelName(models[0].name)) : "",
              loaded: models.length }
   }
 
+  // A runtime with no work counter -- `openai` has none -- must not reach
+  // sumMetric, which coerces a null metric name to the string "null" and then
+  // dereferences the null itself. That threw inside _finish BEFORE _pending
+  // was decremented, so `probing` stayed true and every later refresh returned
+  // early: the widget froze on stale data, permanently, from one response body
+  // containing a line that begins with "null".
+  if (!rt.work) return null
   var work = sumMetric(body, rt.work)
   if (work === null) return null
   return {
@@ -313,20 +340,8 @@ function fleetState(nodes) {
   }
 }
 
-// Tokens per second between two samples, for the panel. Guards the interval
-// because a zero or negative gap would divide by zero and render Infinity.
-function tokensPerSecond(amount, seconds) {
-  if (typeof amount !== "number" || typeof seconds !== "number") return null
-  if (!(seconds > 0)) return null
-  return amount / seconds
-}
 
-// A host:port accepted into a shell command. Deliberately strict: this string
-// is interpolated into a curl invocation, so anything that could end the
-// argument or start another command must be impossible.
-// How long a nickname may be before it is cut. It is rendered in the bar's
-// popup, and the bar belongs to the whole desktop -- a pasted essay should
-// shorten, not reflow the panel.
+
 var MAX_LABEL = 32
 
 // Parse the `servers` setting into { host, label } pairs.
@@ -358,14 +373,33 @@ function parseServers(raw) {
   return out
 }
 
+var MAX_MESSAGE = 160
+function clampField(value) {
+  var text = stripControl(String(value || "")).trim()
+  return text.length > MAX_MESSAGE ? text.slice(0, MAX_MESSAGE - 1) + "\u2026" : text
+}
+
+// Shared by clampField and stripLabel so there is one definition of "what may
+// not appear in anything we render".
+function stripControl(value) {
+  return String(value || "")
+    .replace(/[\x00-\x1f\x7f]/g, "")
+    .replace(/[\u0080-\u009f\u00ad\u061c\u200b-\u200f\u202a-\u202e\u2060\u2066-\u2069\u2028\u2029\ufeff]/g, "")
+}
+
 // A nickname is typed by the user, not served by a node, but it is still
 // rendered -- so it is stripped of anything that could break out of its row
 // and clamped. Same reasoning as any other string this plugin displays.
+// Strip and clamp a longer field than a nickname -- an error message naming
+// several rejected addresses, for instance.
+//
+// This existed only as a CALL until now: Service.qml invoked Model.clampField
+// and Model.js never defined it, carried over from a sibling plugin from
+// memory. The binding that used it threw, QML left the property empty, and the
+// bad-address message it was written to produce never appeared -- the exact
+// silent-drop the feature was meant to end.
 function stripLabel(value) {
-  var text = String(value || "")
-    .replace(/[\x00-\x1f\x7f]/g, "")
-    .replace(/[\u0080-\u009f\u00ad\u061c\u200b-\u200f\u202a-\u202e\u2060\u2066-\u2069\u2028\u2029\ufeff]/g, "")
-    .trim()
+  var text = stripControl(value).trim()
   return text.length > MAX_LABEL ? text.slice(0, MAX_LABEL - 1) + "\u2026" : text
 }
 
@@ -385,6 +419,12 @@ function splitHostPort(spec) {
   return { host: text.slice(0, at), port: parseInt(port, 10) }
 }
 
+// A host:port accepted into a shell command. Deliberately strict: this string
+// is interpolated into a curl invocation, so anything that could end the
+// argument or start another command must be impossible.
+// How long a nickname may be before it is cut. It is rendered in the bar's
+// popup, and the bar belongs to the whole desktop -- a pasted essay should
+// shorten, not reflow the panel.
 function isSafeHost(host) {
   return /^[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]{1,5})?$/.test(String(host || ""))
 }

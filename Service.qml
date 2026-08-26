@@ -4,14 +4,15 @@ import Quickshell
 import Quickshell.Io
 import qs.Commons
 import "Model.js" as Model
+import "Probe.js" as Probe
 
 // Fleet activity for the bar widget.
 //
 // The shape of this file is set by two constraints.
 //
-// One: a vLLM /metrics body is 54-66 KB, and this runs inside the process that
+// One: a vLLM /metrics body is ~68 kB, and this runs inside the process that
 // hosts the whole desktop. So the payload is filtered by `grep` at the fetch
-// boundary and the shell only ever sees ~150 bytes per node.
+// boundary and the shell only ever sees a few hundred bytes per node.
 //
 // Two: activity is a COUNTER DELTA, so every node needs a previous sample to
 // compare against. The first poll after a start can therefore never report
@@ -27,7 +28,6 @@ Item {
   // One entry per configured server. Rebuilt wholesale on each cycle.
   property var nodes: []
   property bool probing: false
-  property string lastError: ""
 
   readonly property var fleet: Model.fleetState(nodes)
   readonly property bool busy: fleet.busy
@@ -65,10 +65,6 @@ Item {
   //
   // This used to re-parse and re-regex the whole `servers` string on every
   // call, and it is called from a binding (`Instantiator.model`) and from
-  // labelFor() for every node in every cycle. It also wrote root.lastError as
-  // a side effect of that binding being evaluated, which is a property write
-  // during binding evaluation -- the reason a test of it blew up with
-  // "root is not defined" rather than merely failing.
   readonly property var configured: {
     var parsed = Model.parseServers(serversSetting)
     var out = [], rejected = []
@@ -127,7 +123,7 @@ Item {
       refreshIntervalSec: refreshIntervalSec,
       baselineReady: baselineReady,
       fleet: fleet,
-      lastError: lastError,
+      rejected: configured.rejected,
       nodes: out
     }, null, 2)
   }
@@ -176,7 +172,7 @@ Item {
     // intend to start.
     proc.command = ["/usr/bin/env", "-u", "BASH_ENV", "-u", "ENV",
                     "/usr/bin/timeout", "--signal=KILL", String(Model.PROBE_TIMEOUT_SEC),
-                    "/usr/bin/bash", "-c", _probeScript(host, known)]
+                    "/usr/bin/bash", "-c", Probe.script(Model, host, known)]
     proc.running = true
   }
 
@@ -186,90 +182,7 @@ Item {
   // When the runtime is not yet known the script sweeps the candidate ports
   // and prints the first that answers, tagged so the reply identifies both the
   // port and the body. A refused port answers in about 45ms.
-  function _probeScript(host, known) {
-    // -f so a non-2xx yields an EMPTY body. Without it, Ollama's own
-    // "404 page not found" page at /metrics is a non-empty body, which made
-    // discovery accept the metrics branch and never reach /api/ps -- the node
-    // then reported as unreachable. Measured against a real Ollama server.
-    // Declared before any branch: the known-node path returns early, and it
-    // rendered "head -c undefined" while this sat further down.
-    var n = Model.MAX_PROBE_BYTES
-    var curl = "curl -sSf --max-time 4"
-    var prefixes = []
-    for (var key in Model.RUNTIMES) {
-      if (Model.RUNTIMES[key].detect) prefixes.push(Model.RUNTIMES[key].detect)
-    }
-    // No escaping here, and none needed: every prefix is a literal from the
-    // RUNTIMES table, matched against /^[A-Za-z0-9_:]+$/ below. There used to
-    // be a `.replace(/:/g, ":")` in this line, which replaced a colon with a
-    // colon -- a no-op wearing the costume of a sanitiser.
-    for (var pi = 0; pi < prefixes.length; pi++) {
-      if (!/^[A-Za-z0-9_:]+$/.test(String(prefixes[pi]))) {
-        _log("refusing a malformed runtime prefix: " + prefixes[pi])
-        return ""
-      }
-    }
-    var isMetrics = "grep -qE '^(" + prefixes.join("|") + ")'"
 
-    // An explicitly configured port is authoritative: probe THAT, never sweep.
-    var addr = Model.splitHostPort(host)
-
-    if (known && known.port) {
-      var rt = Model.runtimeOf(known.runtime)
-      var url = "http://" + addr.host + ":" + known.port + rt.probe
-      var cmd = curl + " " + url
-      if (rt.filter) cmd += " | grep -E '" + rt.filter + "'"
-      // The steady-state path, and it was the UNBOUNDED one: discovery capped
-      // its body while this, which runs on every poll once a node is known,
-      // piped straight into the collector. head closes the pipe, so a server
-      // streaming matching series forever is cut off rather than absorbed.
-      cmd += " | head -c " + Model.MAX_PROBE_BYTES
-      return "{ echo \"PORT " + known.port + "\"; echo \"RT " + known.runtime + "\"; " + cmd +
-             "\n} | head -c " + n
-    }
-
-    // Keep ONLY the series any runtime actually reads, then bound what is
-    // left. Bounding the raw body instead was the bug that made this plugin
-    // useless: a real vLLM /metrics is ~68 kB and publishes
-    // num_requests_running at byte 6343 and generation_tokens_total at 13535,
-    // so `head -c 4000` cut both off. Detection still succeeded -- the `vllm:`
-    // prefix appears early -- so the node reported reachable while readSample
-    // returned null. And because the sample was null the discovered port was
-    // never cached, so every later poll re-ran discovery and truncated again.
-    // Permanently reachable, permanently idle, no error anywhere.
-    //
-    // grep first, head second: the filter output is a handful of lines, and
-    // head still closes the pipe so a hostile endpoint cannot stream forever.
-    var unionFilter = []
-    for (var rk in Model.RUNTIMES) {
-      var rf = Model.RUNTIMES[rk].filter
-      if (rf) unionFilter.push(rf.replace(/^\^/, ""))
-    }
-    var keep = "grep -E '^(" + unionFilter.join("|") + ")'"
-
-    // With a port given, the sweep is a single candidate -- and the address
-    // used to build the URL is the host WITHOUT it.
-    var candidates = addr.port ? [addr.port] : Model.PORT_CANDIDATES
-
-    var lines = []
-    lines.push("for p in " + candidates.join(" ") + "; do")
-    lines.push("  b=$(" + curl + " \"http://" + addr.host + ":$p/metrics\" 2>/dev/null | " + keep + " | head -c " + Model.MAX_PROBE_BYTES + ")")
-    // Only a body that actually carries a known series prefix counts as
-    // metrics; anything else falls through to the next probe.
-    lines.push("  if printf '%s' \"$b\" | " + isMetrics + "; then echo \"PORT $p\"; echo \"BODY\"; printf '%s' \"$b\"; exit 0; fi")
-    lines.push("  b=$(" + curl + " \"http://" + addr.host + ":$p/api/ps\" 2>/dev/null | head -c " + n + ")")
-    lines.push("  case \"$b\" in *'\"models\"'*) echo \"PORT $p\"; echo \"RT ollama\"; printf '%s' \"$b\"; exit 0;; esac")
-    lines.push("  b=$(" + curl + " \"http://" + addr.host + ":$p/v1/models\" 2>/dev/null | head -c " + n + ")")
-    lines.push("  case \"$b\" in *'\"data\"'*) echo \"PORT $p\"; echo \"RT openai\"; exit 0;; esac")
-    lines.push("done")
-    // A single choke point on the whole script's output, not a bound per
-    // branch. Two of the three discovery branches shipped with no ceiling at
-    // all -- `/api/ps` printed an entirely unfiltered body straight to stdout
-    // -- and the per-branch approach is what let that happen: a new branch
-    // inherits nothing. Wrapping the script means no branch, present or
-    // future, can write more than the ceiling however it is written.
-    return "{\n" + lines.join("\n") + "\n} | head -c " + n
-  }
 
   // ── Result assembly ─────────────────────────────────────────────────
 
@@ -288,20 +201,17 @@ Item {
                  activity: { active: false, amount: null }, running: null,
                  waiting: null, loaded: null, firstReading: false }
 
-    // Second line of defence only: the real bound is in the probe script. This
-    // means no parser below can be handed more than the ceiling even if a
-    // future probe forgets it.
-    var text = String(out || "").slice(0, Model.MAX_PROBE_BYTES)
-    if (text.replace(/\s/g, "") !== "") {
-      var portMatch = text.match(/^PORT (\d+)$/m)
-      var rtMatch = text.match(/^RT ([a-z]+)$/m)
-      var body = text.replace(/^PORT \d+$/m, "").replace(/^RT [a-z]+$/m, "").replace(/^BODY$/m, "")
-
-      var runtime = rtMatch ? rtMatch[1] : Model.detectFromMetrics(body)
-      if (runtime) {
+    // The clamp is a second line of defence only -- the real bound is in the
+    // probe script -- and the parsing lives in Probe.js so it can be tested
+    // against hostile bodies without a running shell.
+    var read = Probe.parse(Model, out, Model.MAX_PROBE_BYTES)
+    if (read) {
+      var runtime = read.runtime
+      var body = read.body
+      {
         node.reachable = true
         node.runtime = runtime
-        node.port = portMatch ? parseInt(portMatch[1]) : prev.port
+        node.port = read.port !== null ? read.port : prev.port
         var rt = Model.runtimeOf(runtime)
         node.canReportActivity = !(rt && rt.noActivity)
 
@@ -314,10 +224,19 @@ Item {
           node.loaded = sample.loaded
           if (prev.sample) node.activity = Model.activityBetween(prev.sample, sample)
           else node.firstReading = true
-          _state[host] = { host: host, port: node.port, runtime: runtime, sample: sample, lastSeenMs: now }
-        } else if (rt && rt.noActivity) {
-          _state[host] = { host: host, port: node.port, runtime: runtime, sample: null, lastSeenMs: now }
         }
+
+        // Cache what was DETECTED, whether or not a sample parsed.
+        //
+        // Caching only on a successful sample meant a node that answered but
+        // yielded nothing usable was never remembered, so the full sweep --
+        // five ports times three endpoints -- re-ran on every refresh. At the
+        // default interval that is five requests a second against that host,
+        // indefinitely, while the panel showed it reachable and idle. A server
+        // triggers it by emitting `vllm:` without a token counter, which is
+        // also what an ordinary version skew produces.
+        _state[host] = { host: host, port: node.port, runtime: runtime,
+                         sample: sample || null, lastSeenMs: now }
       }
     }
 
