@@ -163,15 +163,22 @@ curl -sSf http://YOUR_SERVER:8000/metrics | head
 ## Development
 
 ```sh
-npm test                      # 63 tests, no dependencies
+npm test                      # 67 tests, no dependencies
 omarchy plugin validate .
 ```
 
 Pure logic lives in plain JavaScript precisely so it is testable without a
-running shell: `Model.js` holds the runtime adapters, Prometheus parsing,
-sampling and the activity maths, and `Probe.js` builds the probe command and
-reads what it prints back. `Service.qml` is the process pool, timers and IPC;
-`Panel.qml` draws.
+running shell:
+
+| file | job |
+|---|---|
+| `Model.js` | runtime adapters, Prometheus parsing, sampling, activity maths |
+| `Probe.js` | builds the probe command, reads what it prints back |
+| `Service.qml` | process pool, timers, cycle bookkeeping, IPC |
+| `Panel.qml` | the panel and its headline copy |
+| `NodeRow.qml` | one server's row |
+| `ColumnWidths.qml` | measures each column once for the whole table |
+| `FleetIcon.qml` | the bar glyph |
 
 That split is not tidiness. Logic living in QML can only be reached by tests
 through a source extractor, and both of the worst defects found in review were

@@ -11,7 +11,7 @@ const source = fs.readFileSync(path.join(__dirname, "..", "Model.js"), "utf8")
 const Model = new Function(
   source +
     "; return { RUNTIMES, PORT_CANDIDATES, runtimeOf, detectFromMetrics, sumMetric," +
-    " readSample, activityBetween, fleetState, isSafeHost, MAX_PROBE_BYTES, parseServers, stripLabel, MAX_LABEL, splitHostPort, PROBE_TIMEOUT_SEC, modelFromMetrics, shortModelName, avgMetric, clampField, stripControl, MAX_MESSAGE }"
+    " readSample, activityBetween, fleetState, isSafeHost, MAX_PROBE_BYTES, parseServers, stripLabel, MAX_LABEL, splitHostPort, PROBE_TIMEOUT_SEC, modelFromMetrics, shortModelName, avgMetric, stateLabel, clampField, stripControl, MAX_MESSAGE }"
 )()
 
 // Captured verbatim from a live vLLM node (DGX Spark), trimmed to the series
@@ -1067,4 +1067,50 @@ test("the verified level is one of the ones the README explains", () => {
     assert.equal(Model.RUNTIMES[k].verified, "names",
       `${k} has never been run and must not claim otherwise`)
   }
+})
+
+// ── Structure guards ─────────────────────────────────────────────────
+// The layout is the point, not an accident, and QML is parsed by no tool in
+// this repo -- so the shape has to be asserted here or it will drift back.
+
+test("no QML file carries pure logic that belongs in JS", () => {
+  // Logic in QML can only be reached by tests through a source extractor, and
+  // both of the worst defects found in review lived in exactly that region.
+  const budgets = { "Service.qml": 340, "Panel.qml": 260, "NodeRow.qml": 200, "ColumnWidths.qml": 140 }
+  for (const [file, max] of Object.entries(budgets)) {
+    const n = fs.readFileSync(path.join(__dirname, "..", file), "utf8").split("\n").length
+    assert.ok(n <= max, `${file} is ${n} lines, over its ${max}-line budget — split it`)
+  }
+})
+
+test("the row does not measure for itself", () => {
+  // Every row is handed identical widths so the columns line up. A row that
+  // measured would drift the moment two nicknames differed in length.
+  const row = fs.readFileSync(path.join(__dirname, "..", "NodeRow.qml"), "utf8")
+  assert.ok(!/TextMetrics/.test(row), "NodeRow measures text itself")
+  assert.ok(!/\broot\./.test(row), "NodeRow still reaches into a parent by id")
+  for (const p of ["labelWidth", "hostWidth", "runtimeWidth", "stateWidth", "rowContentWidth"]) {
+    assert.ok(new RegExp("property real " + p).test(row), `NodeRow does not take ${p}`)
+  }
+})
+
+test("an unknown column measures nothing rather than the wrong thing", () => {
+  // _widest dispatched on a string with the runtime label as its default, so a
+  // typo silently measured the wrong field.
+  const src = fs.readFileSync(path.join(__dirname, "..", "ColumnWidths.qml"), "utf8")
+  const fn = src.slice(src.indexOf("function _widest"))
+  assert.ok(/else \{\s*\n\s*return ""/.test(fn),
+    "an unknown column name still falls through to a default")
+})
+
+test("stateLabel is one definition, used by both the row and the measurement", () => {
+  // It lived in Panel.qml, where the row and the column measurement each
+  // needed it and only a source extractor could test it.
+  assert.equal(typeof Model.stateLabel, "function")
+  for (const file of ["NodeRow.qml", "ColumnWidths.qml"]) {
+    const src = fs.readFileSync(path.join(__dirname, "..", file), "utf8")
+    assert.ok(/Model\.stateLabel\(/.test(src), `${file} does not use the shared state label`)
+  }
+  const panel = fs.readFileSync(path.join(__dirname, "..", "Panel.qml"), "utf8")
+  assert.ok(!/function stateTextFor/.test(panel), "the old copy is back in Panel.qml")
 })

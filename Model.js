@@ -441,3 +441,20 @@ function splitHostPort(spec) {
 function isSafeHost(host) {
   return /^[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]{1,5})?$/.test(String(host || ""))
 }
+
+// What a row is allowed to claim about a node, in order of honesty.
+//
+// Pure: node in, string out. It lived in Panel.qml, where the row and the
+// column measurement each needed it and only a source extractor could test it.
+function stateLabel(node) {
+  if (!node) return ""
+  if (!node.reachable) return "unreachable"
+  if (node.canReportActivity === false) return "no activity signal"
+  if (node.firstReading) return "measuring"
+  if (node.activity && node.activity.active) {
+    return typeof node.activity.amount === "number" && node.activity.amount > 0
+      ? "working  " + node.activity.amount + " tok"
+      : "working"
+  }
+  return "idle"
+}
