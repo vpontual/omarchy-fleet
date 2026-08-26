@@ -81,6 +81,9 @@ Panel {
     function show(): void { root.open() }
     function hide(): void { root.close() }
     function refresh(): string { fleet.refresh(); return "ok" }
+    // Forgets what was detected first -- the escape hatch for a node found
+    // before its metrics endpoint was enabled.
+    function rediscover(): string { fleet.rediscover(); return "ok" }
     function busy(): string { return fleet.busy ? "busy" : "idle" }
     function diagnostics(): string { return fleet.diagnosticsJson() }
   }

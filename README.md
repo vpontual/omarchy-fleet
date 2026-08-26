@@ -156,7 +156,12 @@ the plugin writes no files and installs nothing.
 | `Esc` | close |
 
 Over IPC: `open`, `close`, `show`, `hide`, `toggle`, `refresh`, `busy`,
-`diagnostics`.
+`diagnostics`, and `rediscover`.
+
+`rediscover` forgets what was detected and probes from scratch. Use it if a
+server was found before its metrics endpoint was enabled — the runtime and port
+are cached deliberately, so `llama-server` started without `--metrics` is
+remembered as an OpenAI-compatible endpoint until you clear it.
 
 ## Troubleshooting
 
@@ -175,7 +180,7 @@ curl -sSf http://YOUR_SERVER:8000/metrics | head
 ## Development
 
 ```sh
-npm test                      # 72 tests, no dependencies
+npm test                      # 81 tests, no dependencies
 omarchy plugin validate .
 ```
 

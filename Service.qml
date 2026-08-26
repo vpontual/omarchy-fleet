@@ -116,12 +116,7 @@ Item {
     var out = []
     for (var i = 0; i < nodes.length; i++) {
       var n = nodes[i]
-      out.push({ host: n.host, label: n.label || "", port: n.port,
-                 runtime: n.runtime, reachable: n.reachable,
-                 canReportActivity: n.canReportActivity, active: !!(n.activity && n.activity.active),
-                 tokens: n.activity ? n.activity.amount : null,
-                 running: n.running, waiting: n.waiting,
-                 cache: n.cache, model: n.model || "", firstReading: n.firstReading })
+      out.push(Model.nodeSummary(n))
     }
     return JSON.stringify({
       plugin: "veepee.fleet",
@@ -135,6 +130,18 @@ Item {
   }
 
   // ── Polling ─────────────────────────────────────────────────────────
+
+  // Forget what was detected, so the next poll re-discovers from scratch.
+  //
+  // A misdetection was otherwise permanent for the life of the shell: start
+  // llama-server WITHOUT --metrics and it is found on /v1/models as `openai`,
+  // cached, and reads "no activity signal" forever -- restarting llama.cpp
+  // with --metrics does not help, only restarting omarchy-shell does. The
+  // manual refresh is the natural place to offer that.
+  function rediscover() {
+    _state = {}
+    refresh()
+  }
 
   function refresh() {
     if (probing) return
@@ -155,6 +162,7 @@ Item {
     // flickered in and out of the panel with nothing to say why.
     _cycle++
     probing = true
+    probeWatchdog.restart()
     _collected = []
     _pending = servers.length
     for (var i = 0; i < servers.length; i++) probeHost(servers[i].host, i, _cycle)
@@ -201,11 +209,7 @@ Item {
     }
     var now = Date.now()
     var prev = _state[host] || {}
-    var node = { host: host, label: labelFor(host), cache: null, model: "",
-                 reachable: false, runtime: prev.runtime || null,
-                 port: prev.port || null, canReportActivity: true,
-                 activity: { active: false, amount: null }, running: null,
-                 waiting: null, loaded: null, firstReading: false }
+    var node = Model.blankNode(host, labelFor(host), prev)
 
     // The clamp is a second line of defence only -- the real bound is in the
     // probe script -- and the parsing lives in Probe.js so it can be tested
@@ -220,6 +224,10 @@ Item {
         node.port = read.port !== null ? read.port : prev.port
         var rt = Model.runtimeOf(runtime)
         node.canReportActivity = !(rt && rt.noActivity)
+        // Answered, but published nothing readable. "idle" would be a claim
+        // about work; this is an absence of evidence, and the two must not
+        // look the same.
+        if (read.sampleless) node.canReportActivity = false
 
         var sample = Model.readSample(runtime, body)
         if (sample) {
@@ -227,8 +235,13 @@ Item {
           node.waiting = sample.waiting
           node.cache = sample.cache
           node.model = sample.model
-          node.loaded = sample.loaded
-          if (prev.sample) node.activity = Model.activityBetween(prev.sample, sample)
+          // No activity signal AT ALL -- neither a work counter nor Ollama's
+          // keep-alive token. `work === null` alone is not that test: Ollama
+          // legitimately has no counter and signals through `token`, so
+          // checking only `work` marked every healthy Ollama node as unable to
+          // report activity. Caught by looking at a real one.
+          if (sample.work === null && !sample.token) node.canReportActivity = false
+          else if (prev.sample) node.activity = Model.activityBetween(prev.sample, sample)
           else node.firstReading = true
         }
 
@@ -259,6 +272,7 @@ Item {
       _collected.sort(function (a, b) { return a.host < b.host ? -1 : 1 })
       nodes = _collected
       probing = false
+      probeWatchdog.stop()
       var ready = nodes.length > 0
       for (var i = 0; i < nodes.length; i++) {
         if (nodes[i].reachable && nodes[i].firstReading) ready = false
@@ -300,9 +314,14 @@ Item {
   // returns early while `probing` is true. curl carries --max-time, so this is
   // the backstop for the process itself failing to exit.
   Timer {
+    id: probeWatchdog
     interval: 15000
-    repeat: true
-    running: true
+    // Restarted by refresh(), so this is a deadline for THIS cycle rather than
+    // a clock. Free-running, it fired at t=15, 30, 45... regardless of when a
+    // cycle began -- so a cycle starting at 14.9s was abandoned 100ms in, and
+    // the panel could sit stale for up to two intervals while it recovered.
+    repeat: false
+    running: false
     onTriggered: {
       if (!root.probing) return
       root._log("probe cycle did not finish within 15s; resetting")

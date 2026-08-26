@@ -271,8 +271,7 @@ function readSample(runtimeName, body) {
              // Tail FIRST, then clamp -- the same ordering the metrics path
              // uses. Clamping first let a long prefix eat the budget, and
              // "hf.co/unsloth/Qwen3-Coder-30B-..." is an ordinary Ollama name.
-             cache: null, model: models.length ? stripLabel(shortModelName(models[0].name)) : "",
-             loaded: models.length }
+             cache: null, model: models.length ? stripLabel(shortModelName(models[0].name)) : "" }
   }
 
   // A runtime with no work counter -- `openai` has none -- must not reach
@@ -283,7 +282,22 @@ function readSample(runtimeName, body) {
   // containing a line that begins with "null".
   if (!rt.work) return null
   var work = sumMetric(body, rt.work)
-  if (work === null) return null
+  // No work counter in this body -- a partial or version-skewed exporter. Say
+  // so, and keep whatever it DID publish rather than discarding it: a node
+  // running 8 requests at 97% cache was drawn as quiet because the one series
+  // used for the delta was missing.
+  if (work === null) {
+    var partial = {
+      work: null, token: null,
+      running: sumMetric(body, rt.running),
+      waiting: rt.waiting ? sumMetric(body, rt.waiting) : null,
+      cache: rt.cache ? avgMetric(body, rt.cache) : null,
+      model: modelFromMetrics(body)
+    }
+    var anything = partial.running !== null || partial.waiting !== null ||
+                   partial.cache !== null || partial.model !== ""
+    return anything ? partial : null
+  }
   return {
     work: work,
     token: null,
@@ -292,8 +306,7 @@ function readSample(runtimeName, body) {
     // A fraction on the wire; a percentage is what a person reads.
     // AVERAGED, not summed: this is a fraction per engine, not a count.
     cache: rt.cache ? avgMetric(body, rt.cache) : null,
-    model: modelFromMetrics(body),
-    loaded: null
+    model: modelFromMetrics(body)
   }
 }
 
@@ -461,4 +474,34 @@ function stateLabel(node) {
       : "working"
   }
   return "idle"
+}
+
+// A node record before anything has been read, carrying forward only what a
+// previous cycle established. One definition of the shape, so a new field
+// cannot be added in Service.qml and forgotten in diagnostics.
+function blankNode(host, label, prev) {
+  var known = prev || {}
+  return {
+    host: host, label: label,
+    reachable: false, runtime: known.runtime || null, port: known.port || null,
+    canReportActivity: true, activity: { active: false, amount: null },
+    running: null, waiting: null, cache: null, model: "",
+    firstReading: false
+  }
+}
+
+// One node, flattened for the diagnostics verb.
+//
+// It was assembled by hand in Service.qml, where it had already drifted from
+// the record it summarises -- `label` and `cache` were each added to the node
+// and forgotten here once.
+function nodeSummary(n) {
+  return {
+    host: n.host, label: n.label || "", port: n.port, runtime: n.runtime,
+    reachable: n.reachable, canReportActivity: n.canReportActivity,
+    active: !!(n.activity && n.activity.active),
+    tokens: n.activity ? n.activity.amount : null,
+    running: n.running, waiting: n.waiting, cache: n.cache,
+    model: n.model || "", firstReading: n.firstReading
+  }
 }

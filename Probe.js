@@ -27,7 +27,6 @@ function script(Model, host, known) {
   // colon -- a no-op wearing the costume of a sanitiser.
   for (var pi = 0; pi < prefixes.length; pi++) {
     if (!/^[A-Za-z0-9_:]+$/.test(String(prefixes[pi]))) {
-      log("refusing a malformed runtime prefix: " + prefixes[pi])
       return ""
     }
   }
@@ -46,8 +45,34 @@ function script(Model, host, known) {
     // piped straight into the collector. head closes the pipe, so a server
     // streaming matching series forever is cut off rather than absorbed.
     cmd += " | head -c " + Model.MAX_PROBE_BYTES
-    return "{ echo \"PORT " + known.port + "\"; echo \"RT " + known.runtime + "\"; " + cmd +
-           "\n} | head -c " + n
+    // The markers are emitted ONLY after something answered.
+    //
+    // They used to be echoed unconditionally, before curl ran -- so every
+    // failure of a known node (refused, timeout, DNS, 5xx, the kill timer
+    // firing) still produced "PORT n\nRT vllm\n", which parses as a perfectly
+    // good reading. The node was drawn idle, in green, forever: a box that lost
+    // power was indistinguishable from a healthy quiet one, which is the single
+    // question this plugin exists to answer.
+    //
+    // Discovery never had the bug because it echoes markers inside a branch
+    // that already proved the endpoint answered. This is that shape. Three
+    // outcomes, kept distinct:
+    //   a filtered body -> reachable, with a sample
+    //   NOSAMPLE        -> answered, but published nothing we can read
+    //   nothing at all  -> down
+    // The second costs an extra request, and only when the first found
+    // nothing, so a healthy node is still one request.
+    var markers = "echo \"PORT " + known.port + "\"; echo \"RT " + known.runtime + "\""
+    return "{\n" +
+           "b=$(" + cmd + ")\n" +
+           "if [ -n \"$b\" ]; then\n" +
+           "  " + markers + "\n" +
+           "  printf '%s' \"$b\"\n" +
+           "elif " + curl + " -o /dev/null " + url + " 2>/dev/null; then\n" +
+           "  " + markers + "\n" +
+           "  echo NOSAMPLE\n" +
+           "fi\n" +
+           "} | head -c " + n
   }
 
   // Keep ONLY the series any runtime actually reads, then bound what is
@@ -108,6 +133,7 @@ function parse(Model, text, maxBytes) {
   var body = clipped.replace(/^PORT \d+$/m, "")
                     .replace(/^RT [a-z]+$/m, "")
                     .replace(/^BODY$/m, "")
+                    .replace(/^NOSAMPLE$/m, "")
 
   var runtime = rtMatch ? rtMatch[1] : Model.detectFromMetrics(body)
   if (!runtime) return null
@@ -119,5 +145,9 @@ function parse(Model, text, maxBytes) {
     var n = parseInt(portMatch[1], 10)
     if (n >= 1 && n <= 65535) port = n
   }
-  return { runtime: runtime, port: port, body: body }
+  // Answered, but published nothing this adapter can read. Distinct from a
+  // sample and distinct from silence -- collapsing it into either is how a
+  // saturated node gets drawn as quiet.
+  var sampleless = /^NOSAMPLE$/m.test(clipped)
+  return { runtime: runtime, port: port, body: body, sampleless: sampleless }
 }

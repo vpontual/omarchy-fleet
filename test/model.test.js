@@ -11,7 +11,7 @@ const source = fs.readFileSync(path.join(__dirname, "..", "Model.js"), "utf8")
 const Model = new Function(
   source +
     "; return { RUNTIMES, PORT_CANDIDATES, runtimeOf, detectFromMetrics, sumMetric," +
-    " readSample, activityBetween, fleetState, isSafeHost, MAX_PROBE_BYTES, parseServers, stripLabel, MAX_LABEL, splitHostPort, PROBE_TIMEOUT_SEC, modelFromMetrics, shortModelName, avgMetric, stateLabel, clampField, stripControl, MAX_MESSAGE }"
+    " readSample, activityBetween, fleetState, isSafeHost, MAX_PROBE_BYTES, parseServers, stripLabel, MAX_LABEL, splitHostPort, PROBE_TIMEOUT_SEC, modelFromMetrics, shortModelName, avgMetric, stateLabel, blankNode, nodeSummary, clampField, stripControl, MAX_MESSAGE }"
 )()
 
 // Captured verbatim from a live vLLM node (DGX Spark), trimmed to the series
@@ -333,9 +333,17 @@ test("EVERY probe path is bounded, not just discovery", () => {
     const curls = script.match(/curl [^\n]*/g) || []
     assert.ok(curls.length > 0, `${name} probe runs no curl at all`)
     for (const c of curls) {
-      assert.ok(/head -c \d+/.test(c), `${name}: unbounded curl -> ${c.slice(0, 110)}`)
-      const cap = parseInt(c.match(/head -c (\d+)/)[1])
-      assert.equal(cap, Model.MAX_PROBE_BYTES, `${name}: magic number, not the shared ceiling`)
+      // A curl is acceptable if it is byte-bounded, OR if it discards its
+      // output entirely -- the liveness check writes to /dev/null and exists
+      // only for its exit status, so nothing it fetches can reach the
+      // collector. Anything else is unbounded.
+      const discards = /-o \/dev\/null/.test(c)
+      const bounded = /head -c \d+/.test(c)
+      assert.ok(bounded || discards, `${name}: unbounded curl -> ${c.slice(0, 110)}`)
+      if (bounded) {
+        const cap = parseInt(c.match(/head -c (\d+)/)[1])
+        assert.equal(cap, Model.MAX_PROBE_BYTES, `${name}: magic number, not the shared ceiling`)
+      }
     }
     // And the whole script is bounded as one, so a future branch inherits it.
     assert.ok(new RegExp("\\}\\s*\\| head -c " + Model.MAX_PROBE_BYTES + "\\s*$").test(script.trim()),
@@ -352,7 +360,11 @@ test("EVERY probe path is bounded, not just discovery", () => {
 test("the known-node probe actually cuts off a flooding server", () => {
   const cp = require("node:child_process")
   const script = renderProbe("10.0.0.1", { port: 8000, runtime: "vllm" })
-  const pipe = script.slice(script.indexOf("| grep -E"))
+  // The fetching curl's pipeline, up to the end of its bound -- the script now
+  // also contains a liveness curl that fetches nothing.
+  const m = script.match(/\| (grep -E '[^']*') \| (head -c \d+)/)
+  assert.ok(m, `the known-node fetch is not filtered and bounded: ${script}`)
+  const pipe = "| " + m[1] + " | " + m[2]
   const flood = 'vllm:num_requests_running{model_name="m"} 1.0\n'.repeat(300000)
   const r = cp.spawnSync("bash", ["-c", `cat ${pipe}`],
     { input: flood, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 })
@@ -877,7 +889,19 @@ test("every Text that renders anything declares PlainText", () => {
   // seven declarations left the whole suite green. QML is parsed by no tool in
   // this repo, so a Text added later is the defence most likely to be lost
   // silently.
-  for (const file of ["Panel.qml", "FleetIcon.qml"]) {
+  // EVERY .qml in the plugin, discovered from disk rather than listed. The
+  // list used to be ["Panel.qml", "FleetIcon.qml"] -- written when all seven
+  // Text blocks lived in Panel.qml. The split moved five of them into
+  // NodeRow.qml, the file that renders the model id, host, state and queue
+  // depth: every server-controlled string. FleetIcon.qml has no Text at all,
+  // so the guard was passing vacuously on one file and covering two of seven
+  // Texts on the other. Deleting every declaration from NodeRow.qml left the
+  // whole suite green.
+  const root = path.join(__dirname, "..")
+  const qmlFiles = fs.readdirSync(root).filter(f => f.endsWith(".qml"))
+  assert.ok(qmlFiles.length >= 4, `expected the plugin's QML files, saw ${qmlFiles}`)
+  let totalText = 0
+  for (const file of qmlFiles) {
     const src = fs.readFileSync(path.join(__dirname, "..", file), "utf8")
     const declared = (src.match(/\bText\s*\{/g) || []).length
     const plain = (src.match(/textFormat:\s*Text\.PlainText/g) || []).length
@@ -885,7 +909,10 @@ test("every Text that renders anything declares PlainText", () => {
       `${file}: ${declared} Text blocks but ${plain} declare PlainText`)
     assert.ok(!/Text\.AutoText|Text\.RichText|Text\.StyledText/.test(src),
       `${file} renders markup`)
+    totalText += declared
   }
+  // And the guard must actually be covering something.
+  assert.ok(totalText >= 5, `only ${totalText} Text blocks found; the guard is vacuous`)
 })
 
 test("the ceilings are sane values, not merely referenced ones", () => {
@@ -1069,6 +1096,22 @@ test("the verified level is one of the ones the README explains", () => {
   }
 })
 
+// Source with comments stripped.
+//
+// Five separate assertions in this suite have now matched text inside the very
+// comment that explained the fix, and passed with the defence deleted. Any
+// check on QML or JS source goes through this.
+function codeLines(src) {
+  return src.split("\n").filter(l => !l.trim().startsWith("//")).join("\n")
+}
+
+function codeOf(file) {
+  return fs.readFileSync(path.join(__dirname, "..", file), "utf8")
+    .split("\n")
+    .filter(l => !l.trim().startsWith("//"))
+    .join("\n")
+}
+
 // ── Structure guards ─────────────────────────────────────────────────
 // The layout is the point, not an accident, and QML is parsed by no tool in
 // this repo -- so the shape has to be asserted here or it will drift back.
@@ -1086,7 +1129,7 @@ test("no QML file carries pure logic that belongs in JS", () => {
 test("the row does not measure for itself", () => {
   // Every row is handed identical widths so the columns line up. A row that
   // measured would drift the moment two nicknames differed in length.
-  const row = fs.readFileSync(path.join(__dirname, "..", "NodeRow.qml"), "utf8")
+  const row = codeOf("NodeRow.qml")
   assert.ok(!/TextMetrics/.test(row), "NodeRow measures text itself")
   assert.ok(!/\broot\./.test(row), "NodeRow still reaches into a parent by id")
   for (const p of ["labelWidth", "hostWidth", "runtimeWidth", "stateWidth", "rowContentWidth"]) {
@@ -1196,4 +1239,179 @@ test("the row's own columns are bound to the widths it was given", () => {
   // And no column may carry a hardcoded pixel width.
   const literals = [...row.matchAll(/width:\s*(\d+)\s*$/gm)].map(m => m[1])
   assert.deepEqual(literals, [], `hardcoded column widths: ${literals}`)
+})
+
+// ── The reachability blocker, and its neighbours ─────────────────────
+
+test("a known node that stops answering is reported unreachable, not idle", () => {
+  // The worst defect this plugin has had. The PORT/RT markers were echoed
+  // unconditionally, BEFORE curl ran, so every failure of a known node
+  // (refused, timeout, DNS, 5xx, the kill timer firing) still produced
+  // "PORT n\nRT vllm\n" -- which parses as a perfectly good reading. The row
+  // said "idle" in green, the warning badge never lit, and diagnostics
+  // reported reachable:true. A box that lost power looked exactly like a
+  // healthy quiet one, forever.
+  const cp = require("node:child_process"), net = require("node:net")
+  // A port nothing is listening on.
+  const srv = net.createServer()
+  let port
+  const done = new Promise(r => srv.listen(0, "127.0.0.1", () => { port = srv.address().port; srv.close(r) }))
+  return done.then(() => {
+    const script = renderProbe("127.0.0.1:" + port, { port: port, runtime: "vllm" })
+    const out = cp.spawnSync("bash", ["-c", script], { encoding: "utf8", timeout: 25000 }).stdout || ""
+    assert.equal(out.trim(), "", `a dead node still produced: ${JSON.stringify(out)}`)
+    assert.equal(Probe.parse(Model, out, Model.MAX_PROBE_BYTES), null,
+      "a dead node parsed as a reading")
+  })
+})
+
+test("the markers are never emitted before something answers", () => {
+  // The structural form of the same bug: on every path, our PORT/RT echo must
+  // sit inside a branch that already proved the endpoint replied.
+  for (const known of [null, { port: 8000, runtime: "vllm" }]) {
+    const script = codeLines(renderProbe("10.0.0.1", known))
+    const firstEcho = script.search(/echo "PORT/)
+    const firstCurl = script.search(/curl /)
+    assert.ok(firstCurl !== -1, "no curl in the script")
+    assert.ok(firstCurl < firstEcho,
+      `markers are echoed before any curl runs: ${script.slice(0, 120)}`)
+  }
+})
+
+test("answered-but-unreadable is distinct from both a sample and silence", () => {
+  // Collapsing it into "idle" is how a saturated node gets drawn as quiet;
+  // collapsing it into "down" hides a server that is plainly alive.
+  const withSample = Probe.parse(Model, "PORT 8000\nRT vllm\nvllm:x 1\n", 9999)
+  assert.equal(withSample.sampleless, false)
+
+  const answered = Probe.parse(Model, "PORT 8000\nRT vllm\nNOSAMPLE\n", 9999)
+  assert.equal(answered.sampleless, true, "NOSAMPLE was not recognised")
+  assert.ok(!/NOSAMPLE/.test(answered.body), "the marker leaked into the body")
+
+  assert.equal(Probe.parse(Model, "", 9999), null)
+
+  // And the service must turn that into an honest label, not "idle".
+  const svc = codeOf("Service.qml")
+  assert.ok(/read\.sampleless/.test(svc), "Service ignores sampleless")
+  assert.ok(/sampleless\)\s*node\.canReportActivity = false/.test(svc.replace(/\s+/g, " ")),
+    "a sampleless node is not marked as unable to report activity")
+})
+
+test("a partial exporter keeps the numbers it did publish", () => {
+  // readSample used to return null the moment the work counter was missing,
+  // throwing away running/waiting/cache/model with it -- so a node at 8
+  // requests and 97% cache was drawn as quiet AND lost its own numbers.
+  const partial = [
+    'vllm:num_requests_running{engine="0"} 8',
+    'vllm:num_requests_waiting{engine="0"} 3',
+    'vllm:kv_cache_usage_perc{engine="0"} 0.97'
+  ].join("\n")
+  const s = Model.readSample("vllm", partial)
+  assert.ok(s, "a partial body produced nothing at all")
+  assert.equal(s.work, null, "there is no work counter to report")
+  assert.equal(s.running, 8)
+  assert.equal(s.waiting, 3)
+  assert.equal(s.cache, 0.97)
+  // With nothing readable at all it is still null.
+  assert.equal(Model.readSample("vllm", "unrelated: 1"), null)
+  // And a node that cannot report activity does not claim to be idle.
+  assert.equal(Model.stateLabel({ reachable: true, canReportActivity: false }),
+    "no activity signal")
+})
+
+test("the poll watchdog is a deadline for the cycle, not a clock", () => {
+  // Free-running, it fired at t=15, 30, 45... regardless of when a cycle
+  // began, so a cycle starting at 14.9s was abandoned 100ms in and the panel
+  // could sit stale for up to two intervals while it recovered.
+  const svc = codeOf("Service.qml")
+  assert.ok(/id: probeWatchdog/.test(svc), "the watchdog has no id to restart")
+  assert.ok(/repeat: false/.test(svc.slice(svc.indexOf("id: probeWatchdog"))),
+    "the watchdog still repeats on a clock")
+  const refresh = codeLines(extractFunction("refresh"))
+  assert.ok(/probeWatchdog\.restart\(\)/.test(refresh),
+    "refresh() does not start the deadline for its own cycle")
+  assert.ok(/probeWatchdog\.stop\(\)/.test(svc),
+    "a completed cycle never cancels its deadline")
+})
+
+test("a misdetection can be cleared without restarting the shell", () => {
+  // _state is never invalidated, so llama-server started WITHOUT --metrics is
+  // found on /v1/models as `openai`, cached, and reads "no activity signal"
+  // forever -- restarting llama.cpp with --metrics does not help.
+  const svc = codeOf("Service.qml")
+  assert.ok(/function rediscover\(\)/.test(svc), "there is no way to forget a detection")
+  const fn = codeLines(extractFunction("rediscover"))
+  assert.ok(/_state = \{\}/.test(fn), "rediscover does not clear the cache")
+  assert.ok(/refresh\(\)/.test(fn), "rediscover does not then poll")
+  // And it must be reachable from outside.
+  const panel = codeOf("Panel.qml")
+  assert.ok(/function rediscover\(\): string/.test(panel), "rediscover is not exposed over IPC")
+})
+
+test("the node record has one definition", () => {
+  // It was built inline in Service.qml, so a new field could be added there
+  // and forgotten in diagnostics.
+  const n = Model.blankNode("h", "L", { runtime: "vllm", port: 8000 })
+  assert.equal(n.host, "h")
+  assert.equal(n.label, "L")
+  assert.equal(n.runtime, "vllm", "what a previous cycle learned must carry forward")
+  assert.equal(n.port, 8000)
+  assert.equal(n.reachable, false, "a fresh record must not claim reachability")
+  assert.equal(n.canReportActivity, true)
+  assert.deepEqual(n.activity, { active: false, amount: null })
+  for (const f of ["running", "waiting", "cache", "loaded"]) assert.equal(n[f], null, f)
+  assert.equal(n.model, "")
+  // With no history it carries nothing.
+  const fresh = Model.blankNode("h", "", null)
+  assert.equal(fresh.runtime, null)
+  assert.equal(fresh.port, null)
+  assert.ok(!/var node = \{/.test(codeOf("Service.qml")), "the inline copy is back")
+})
+
+test("Ollama's keep-alive signal is not mistaken for no signal at all", () => {
+  // Ollama has no token counter, so its sample legitimately carries
+  // work === null and signals through `token` instead. A guard that tested
+  // only `work` marked every healthy Ollama node as unable to report activity
+  // — found by looking at a real one, not by the suite.
+  const body = JSON.stringify({ models: [
+    { name: "qwen3:4b", expires_at: "2026-01-01T00:05:00Z" }] })
+  const s = Model.readSample("ollama", body)
+  assert.equal(s.work, null, "ollama has no work counter")
+  assert.ok(s.token, "ollama must still carry its keep-alive token")
+
+  const svc = codeOf("Service.qml").replace(/\s+/g, " ")
+  assert.ok(/work === null && !sample\.token/.test(svc),
+    "the no-signal test looks at work alone, which is true for healthy Ollama")
+
+  // Two readings with a moved expiry are activity.
+  const later = Model.readSample("ollama", JSON.stringify({ models: [
+    { name: "qwen3:4b", expires_at: "2026-01-01T00:09:00Z" }] }))
+  assert.equal(Model.activityBetween(s, later).active, true,
+    "a moved keep-alive expiry is the ollama activity signal")
+  assert.equal(Model.activityBetween(s, s).active, false)
+})
+
+test("the diagnostics summary reports every field the node record carries", () => {
+  // It was assembled by hand in Service.qml, where it had already drifted from
+  // the record it summarises: `label` and `cache` were each added to the node
+  // and forgotten here once.
+  const node = Model.blankNode("h", "Nickname", { runtime: "vllm", port: 8000 })
+  node.reachable = true
+  node.running = 2; node.waiting = 1; node.cache = 0.5; node.model = "qwen"
+  node.activity = { active: true, amount: 42 }
+
+  const out = Model.nodeSummary(node)
+  assert.equal(out.host, "h"); assert.equal(out.label, "Nickname")
+  assert.equal(out.port, 8000); assert.equal(out.runtime, "vllm")
+  assert.equal(out.reachable, true); assert.equal(out.active, true)
+  assert.equal(out.tokens, 42); assert.equal(out.running, 2)
+  assert.equal(out.waiting, 1); assert.equal(out.cache, 0.5)
+  assert.equal(out.model, "qwen")
+
+  // Anything the record carries and the summary drops is invisible in the one
+  // place a user can inspect. `activity` is folded into active/tokens.
+  const carried = Object.keys(node).filter(k => k !== "activity")
+  for (const k of carried) {
+    assert.ok(k in out, `the node record carries ${k} and diagnostics drops it`)
+  }
 })

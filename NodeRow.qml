@@ -23,6 +23,10 @@ CursorSurface {
   property real rowContentWidth: 0
 
   // Theme, from the bar rather than re-derived here.
+  // foreground comes from CursorSurface. It is NOT redeclared here: the split
+  // stripped a `root.` prefix off `foreground: root.foreground` and left the
+  // property bound to itself, which survived only because Panel.qml overrides
+  // it at the instantiation site. On its own that is a binding loop.
   property color dim: Color.muted
   property color urgent: Color.urgent
   property color hoverFill: "transparent"
@@ -78,7 +82,6 @@ CursorSurface {
   // Report the width the columns actually occupy, so the panel can size to
   // its content instead of to a fixed number.
   implicitWidth: rowContentWidth + Style.spacing.lg * 2
-  foreground: foreground
   fill: hoverFill
 
   // Nickname, address and runtime as three real columns. The nickname is
