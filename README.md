@@ -180,7 +180,7 @@ curl -sSf http://YOUR_SERVER:8000/metrics | head
 ## Development
 
 ```sh
-npm test                      # 81 tests, no dependencies
+npm test                      # 84 tests, no dependencies
 omarchy plugin validate .
 ```
 

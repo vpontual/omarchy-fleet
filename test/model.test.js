@@ -1293,7 +1293,7 @@ test("answered-but-unreadable is distinct from both a sample and silence", () =>
   // And the service must turn that into an honest label, not "idle".
   const svc = codeOf("Service.qml")
   assert.ok(/read\.sampleless/.test(svc), "Service ignores sampleless")
-  assert.ok(/sampleless\)\s*node\.canReportActivity = false/.test(svc.replace(/\s+/g, " ")),
+  assert.ok(/read\.sampleless && !sample\) node\.canReportActivity = false/.test(svc.replace(/\s+/g, " ")),
     "a sampleless node is not marked as unable to report activity")
 })
 
@@ -1414,4 +1414,71 @@ test("the diagnostics summary reports every field the node record carries", () =
   for (const k of carried) {
     assert.ok(k in out, `the node record carries ${k} and diagnostics drops it`)
   }
+})
+
+test("a server that answers but publishes nothing readable emits NOSAMPLE", () => {
+  // The liveness branch. Replacing it with `elif false` left the whole suite
+  // green: the parse side was tested against the literal marker, and nothing
+  // checked that the SCRIPT ever produces it. Without it, an alive server whose
+  // metrics do not match the filter collapses into "down".
+  const cp = require("node:child_process"), os = require("node:os")
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-nosample-"))
+  try {
+    // Answers 200 with a body carrying none of the series the filter keeps.
+    fs.writeFileSync(path.join(dir, "curl"),
+      '#!/bin/bash\n' +
+      'for a in "$@"; do [ "$a" = "-o" ] && exit 0; done\n' +
+      'printf "# HELP something_else help\\nsomething_else 1\\n"\n')
+    fs.chmodSync(path.join(dir, "curl"), 0o755)
+
+    const script = renderProbe("10.0.0.1:8000", { port: 8000, runtime: "vllm" })
+    const out = cp.spawnSync("/usr/bin/bash", ["-c", script], {
+      env: { ...process.env, PATH: dir + ":" + process.env.PATH },
+      encoding: "utf8", timeout: 20000
+    }).stdout || ""
+
+    assert.ok(/^NOSAMPLE$/m.test(out), `alive-but-unreadable did not emit NOSAMPLE: ${JSON.stringify(out)}`)
+    const read = Probe.parse(Model, out, Model.MAX_PROBE_BYTES)
+    assert.ok(read, "NOSAMPLE did not parse as a reading")
+    assert.equal(read.sampleless, true)
+    assert.equal(read.runtime, "vllm")
+
+    // And a server that is actually down still emits nothing at all.
+    fs.writeFileSync(path.join(dir, "curl"), "#!/bin/bash\nexit 7\n")
+    fs.chmodSync(path.join(dir, "curl"), 0o755)
+    const down = cp.spawnSync("/usr/bin/bash", ["-c", script], {
+      env: { ...process.env, PATH: dir + ":" + process.env.PATH },
+      encoding: "utf8", timeout: 20000
+    }).stdout || ""
+    assert.equal(down.trim(), "", `a dead server produced: ${JSON.stringify(down)}`)
+    assert.equal(Probe.parse(Model, down, Model.MAX_PROBE_BYTES), null)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("a server cannot forge the NOSAMPLE marker", () => {
+  // Our own bytes precede the server's on every branch, so a body containing
+  // the word cannot make a healthy reading look unreadable -- but the marker
+  // is matched with ^...$ multiline, so check it directly.
+  const forged = "PORT 8000\nRT vllm\nvllm:generation_tokens_total 5\nNOSAMPLE\n"
+  const read = Probe.parse(Model, forged, Model.MAX_PROBE_BYTES)
+  // It IS seen -- which is why the branch that emits it must be the only way a
+  // body reaches us without a sample. Confirm the sample still wins.
+  const sample = Model.readSample(read.runtime, read.body)
+  assert.ok(sample, "a real sample beside a forged marker was lost")
+  assert.equal(sample.work, 5, "the real series must still be read")
+})
+
+test("a real sample beats a NOSAMPLE marker in the same body", () => {
+  // The marker is ours, but parse sees it anywhere in the text and one runtime
+  // (ollama) has no filter, so a body could in principle carry the word. It
+  // must never demote a node that plainly published a reading.
+  const svc = codeOf("Service.qml").replace(/\s+/g, " ")
+  assert.ok(/read\.sampleless && !sample/.test(svc),
+    "sampleless is applied without checking whether a sample was obtained")
+  // And it must be evaluated after the sample is read, not before.
+  const code = codeOf("Service.qml")
+  assert.ok(code.indexOf("Model.readSample(runtime, body)") < code.indexOf("read.sampleless"),
+    "sampleless is decided before the sample is even read")
 })

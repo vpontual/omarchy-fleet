@@ -224,12 +224,17 @@ Item {
         node.port = read.port !== null ? read.port : prev.port
         var rt = Model.runtimeOf(runtime)
         node.canReportActivity = !(rt && rt.noActivity)
+        var sample = Model.readSample(runtime, body)
+
         // Answered, but published nothing readable. "idle" would be a claim
         // about work; this is an absence of evidence, and the two must not
         // look the same.
-        if (read.sampleless) node.canReportActivity = false
-
-        var sample = Model.readSample(runtime, body)
+        //
+        // Applied only when there is genuinely no sample. The marker is our
+        // own, but the parser sees it anywhere in the text, and one runtime
+        // (ollama) has no filter -- so a body could in principle carry the
+        // word. A real reading always wins over a marker.
+        if (read.sampleless && !sample) node.canReportActivity = false
         if (sample) {
           node.running = sample.running
           node.waiting = sample.waiting
