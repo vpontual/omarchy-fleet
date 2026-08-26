@@ -1160,3 +1160,40 @@ test("a fractional token delta is rounded before it is shown", () => {
   // And the state column is still sized for what it can hold.
   assert.ok("working  9999 tok".length >= "working  3 tok".length)
 })
+
+test("every width the row declares is both used by it and wired by the panel", () => {
+  // Asserting that the pieces EXIST is not asserting they are connected --
+  // exactly the shape of the clampField defect, where both halves of the
+  // wiring were tested and the function joining them was not. Setting
+  // `width: labelWidth` to a literal, or `labelWidth: widths.label` to 0, both
+  // passed a suite that checked the properties were declared.
+  const row = fs.readFileSync(path.join(__dirname, "..", "NodeRow.qml"), "utf8")
+  const panel = fs.readFileSync(path.join(__dirname, "..", "Panel.qml"), "utf8")
+
+  const declared = [...row.matchAll(/property real (\w+)/g)].map(m => m[1])
+  assert.ok(declared.length >= 5, `expected the width properties, saw ${declared}`)
+
+  for (const p of declared) {
+    // Used for something, not merely declared.
+    const uses = [...row.matchAll(new RegExp("\\b" + p + "\\b", "g"))].length
+    assert.ok(uses >= 2, `NodeRow declares ${p} and never uses it`)
+
+    // And the panel must hand it a real measurement, not a literal.
+    const wired = panel.match(new RegExp(p + ":\\s*([^\\n]+)"))
+    assert.ok(wired, `Panel.qml never wires ${p}`)
+    assert.ok(/widths\./.test(wired[1]),
+      `Panel.qml wires ${p} to ${wired[1].trim()} instead of a measured width`)
+  }
+})
+
+test("the row's own columns are bound to the widths it was given", () => {
+  // The four column Texts must take their width from the passed-in property.
+  const row = fs.readFileSync(path.join(__dirname, "..", "NodeRow.qml"), "utf8")
+  for (const p of ["labelWidth", "hostWidth", "runtimeWidth", "stateWidth"]) {
+    assert.ok(new RegExp("width:\\s*" + p + "\\b").test(row),
+      `no column is sized by ${p}`)
+  }
+  // And no column may carry a hardcoded pixel width.
+  const literals = [...row.matchAll(/width:\s*(\d+)\s*$/gm)].map(m => m[1])
+  assert.deepEqual(literals, [], `hardcoded column widths: ${literals}`)
+})
