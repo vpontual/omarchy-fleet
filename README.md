@@ -3,6 +3,9 @@
 An activity light for self-hosted LLM servers. It answers one question at a
 glance: **is anything actually generating right now?**
 
+Run against vLLM and Ollama. llama.cpp, SGLang and TGI are supported from their
+published metric names but have not been run — see the table below.
+
 ![The panel, with three servers idle and one generating](preview.png)
 
 ## Why
@@ -51,12 +54,21 @@ If you only use hosted APIs, this is not for you — there is nothing to watch.
 
 | Runtime | Detected by | Activity signal | Verified |
 |---|---|---|---|
-| vLLM | `vllm:` series on `/metrics` | generated-token counter, plus running/queued requests | live |
-| SGLang | `sglang:` series on `/metrics` | generated-token counter, plus running/queued | from source |
-| llama.cpp | `llamacpp:` series on `/metrics` | predicted-token counter | from source |
-| TGI | `tgi_` series on `/metrics` | generated-token histogram, batch and queue size | from source |
-| Ollama | `/api/ps` | keep-alive expiry moving — see below | live |
+| vLLM | `vllm:` series on `/metrics` | generated-token counter, plus running/queued and KV cache | **live** |
+| Ollama | `/api/ps` | keep-alive expiry moving — see below | **live** |
+| llama.cpp | `llamacpp:` series on `/metrics` | predicted-token counter, plus processing/deferred | names |
+| SGLang | `sglang:` series on `/metrics` | generated-token counter, plus running/queued | names |
+| TGI | `tgi_` series on `/metrics` | generated-token histogram, batch and queue size | names |
 | OpenAI-compatible | `/v1/models` | none — reported as reachable only | n/a |
+
+**What "verified" means here, precisely.** *live* means I have run it against a
+real server of that kind and watched the activity signal move under load —
+vLLM and Ollama only. *names* means the series it reads are confirmed against
+that project's own source (llama.cpp's metrics test asserts these exact names
+and types; SGLang's production-metrics reference; TGI's router source), and
+the adapter is tested against a body in that shape — **but no such server has
+ever been run against this plugin.** If you use one of those three, you are the
+first, and I would genuinely like to hear whether it worked.
 
 **Ollama has no token counter.** There is no `/metrics` endpoint to read, so
 there is nothing that counts work. What it does expose is each resident model's
@@ -151,7 +163,7 @@ curl -sSf http://YOUR_SERVER:8000/metrics | head
 ## Development
 
 ```sh
-npm test                      # 59 tests, no dependencies
+npm test                      # 63 tests, no dependencies
 omarchy plugin validate .
 ```
 

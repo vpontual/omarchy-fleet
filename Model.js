@@ -54,6 +54,8 @@ var RUNTIMES = {
     // vLLM only -- the others are left null rather than guessed at, matching
     // how `verified` is used throughout this table.
     cache: "vllm:kv_cache_usage_perc",
+    // Run against a real vLLM node, under load, with the counter observed to
+    // move. The only runtime here where activity has actually been watched.
     verified: "live"
   },  ollama: {
     label: "Ollama", port: 11434, probe: "/api/ps", detect: null,
@@ -75,7 +77,12 @@ var RUNTIMES = {
     running: "llamacpp:requests_processing",
     waiting: "llamacpp:requests_deferred",
     // llama-server only serves /metrics when started with --metrics.
-    verified: "source"
+    //
+    // Names confirmed against upstream's OWN test suite
+    // (tools/server/tests/unit/test_metrics.py), which asserts these exact
+    // strings and their types: tokens_predicted_total is a counter,
+    // requests_processing and requests_deferred are gauges. Never run here.
+    verified: "names"
   },  tgi: {
     label: "TGI", port: 8080, probe: "/metrics", detect: "tgi_",
     filter: "^tgi_(request_generated_tokens_sum|batch_current_size|queue_size)",
@@ -83,14 +90,20 @@ var RUNTIMES = {
     work: "tgi_request_generated_tokens_sum",
     running: "tgi_batch_current_size",
     waiting: "tgi_queue_size",
-    verified: "source"
+    // Names confirmed against upstream router source and the metrics
+    // reference: tgi_request_generated_tokens is a Histogram, so _sum is the
+    // monotonic total; batch_current_size and queue_size are gauges. Never run
+    // here.
+    verified: "names"
   },  sglang: {
     label: "SGLang", port: 30000, probe: "/metrics", detect: "sglang:",
     filter: "^sglang:(generation_tokens_total|num_running_reqs|num_queue_reqs)",
     work: "sglang:generation_tokens_total",
     running: "sglang:num_running_reqs",
     waiting: "sglang:num_queue_reqs",
-    verified: "source"
+    // Names confirmed against upstream's production-metrics reference. Never
+    // run here.
+    verified: "names"
   },  openai: {
     label: "OpenAI-compatible", port: 1234, probe: "/v1/models", detect: null,
     filter: null,

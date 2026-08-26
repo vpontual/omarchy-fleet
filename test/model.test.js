@@ -974,3 +974,97 @@ test("a detected node is cached even when no sample could be parsed", () => {
   assert.ok(/sample: sample \|\| null/.test(code),
     "the cached entry does not tolerate a missing sample")
 })
+
+// ── Every adapter, against a body in its documented shape ────────────
+// The support claim in the README rests on these. vLLM and Ollama have been
+// run; llama.cpp, SGLang and TGI have not -- their series names are confirmed
+// against upstream (llama.cpp's own test suite, SGLang's production-metrics
+// reference, TGI's router source) and these exercise the adapters against
+// bodies in that shape. That is weaker than running them, and the `verified`
+// field and the README both say so.
+
+const BODIES = {
+  llamacpp: [
+    "# HELP llamacpp:tokens_predicted_total Number of generated tokens",
+    "# TYPE llamacpp:tokens_predicted_total counter",
+    "llamacpp:tokens_predicted_total 1250",
+    "# TYPE llamacpp:requests_processing gauge",
+    "llamacpp:requests_processing 2",
+    "# TYPE llamacpp:requests_deferred gauge",
+    "llamacpp:requests_deferred 1",
+    "llamacpp:prompt_tokens_total 900"
+  ].join("\n"),
+  sglang: [
+    "# TYPE sglang:generation_tokens_total counter",
+    'sglang:generation_tokens_total{model_name="qwen"} 4400.0',
+    'sglang:num_running_reqs{model_name="qwen"} 3.0',
+    'sglang:num_queue_reqs{model_name="qwen"} 2.0',
+    'sglang:cache_hit_rate{model_name="qwen"} 0.5'
+  ].join("\n"),
+  tgi: [
+    "# TYPE tgi_request_generated_tokens histogram",
+    'tgi_request_generated_tokens_bucket{le="1"} 0',
+    "tgi_request_generated_tokens_sum 8123",
+    "tgi_request_generated_tokens_count 44",
+    "# TYPE tgi_batch_current_size gauge",
+    "tgi_batch_current_size 4",
+    "# TYPE tgi_queue_size gauge",
+    "tgi_queue_size 7"
+  ].join("\n")
+}
+
+test("every metrics runtime is detected from a body in its real shape", () => {
+  for (const [runtime, body] of Object.entries(BODIES)) {
+    assert.equal(Model.detectFromMetrics(body), runtime,
+      `${runtime} is not detected from its own exposition`)
+  }
+})
+
+test("every metrics runtime yields a usable sample", () => {
+  const expected = {
+    llamacpp: { work: 1250, running: 2, waiting: 1 },
+    sglang:   { work: 4400, running: 3, waiting: 2 },
+    tgi:      { work: 8123, running: 4, waiting: 7 }
+  }
+  for (const [runtime, body] of Object.entries(BODIES)) {
+    const s = Model.readSample(runtime, body)
+    assert.ok(s, `${runtime} produced no sample`)
+    assert.equal(s.work, expected[runtime].work, `${runtime} work`)
+    assert.equal(s.running, expected[runtime].running, `${runtime} running`)
+    assert.equal(s.waiting, expected[runtime].waiting, `${runtime} waiting`)
+  }
+})
+
+test("every runtime's filter keeps the series its adapter reads", () => {
+  // The filter decides what the probe returns at all -- a series missing from
+  // it can never be read however correct the parser is. This is how the vLLM
+  // activity signal was silently dead once before.
+  const cp = require("node:child_process")
+  for (const [runtime, body] of Object.entries(BODIES)) {
+    const script = renderProbe("10.0.0.1", { port: 8000, runtime: runtime })
+    const m = script.match(/\| (grep -E '[^']*')/)
+    assert.ok(m, `${runtime} probe does not filter`)
+    const out = cp.spawnSync("bash", ["-c", m[1]], { input: body, encoding: "utf8" }).stdout
+    const s = Model.readSample(runtime, out)
+    assert.ok(s, `${runtime}: the filter discarded what the parser needs`)
+    assert.equal(s.work, Model.readSample(runtime, body).work,
+      `${runtime}: filtered and unfiltered disagree`)
+  }
+})
+
+test("the verified level is one of the ones the README explains", () => {
+  // The README's support table is generated from these by hand. A new value
+  // here without a matching row there is how a support claim drifts.
+  const allowed = ["live", "names", "n/a"]
+  for (const [key, rt] of Object.entries(Model.RUNTIMES)) {
+    assert.ok(allowed.indexOf(rt.verified) !== -1,
+      `${key} claims verification level ${JSON.stringify(rt.verified)}`)
+  }
+  // Only what has actually been run may claim "live".
+  assert.equal(Model.RUNTIMES.vllm.verified, "live")
+  assert.equal(Model.RUNTIMES.ollama.verified, "live")
+  for (const k of ["llamacpp", "sglang", "tgi"]) {
+    assert.equal(Model.RUNTIMES[k].verified, "names",
+      `${k} has never been run and must not claim otherwise`)
+  }
+})
