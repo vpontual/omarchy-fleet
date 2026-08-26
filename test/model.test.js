@@ -1114,3 +1114,49 @@ test("stateLabel is one definition, used by both the row and the measurement", (
   const panel = fs.readFileSync(path.join(__dirname, "..", "Panel.qml"), "utf8")
   assert.ok(!/function stateTextFor/.test(panel), "the old copy is back in Panel.qml")
 })
+
+// ── The minor list from review ───────────────────────────────────────
+
+test("a host listed twice is probed once", () => {
+  // Two entries share a single _state key, so the second result of each cycle
+  // overwrote the first's sample and the activity delta was measured against
+  // the wrong reading: work reported that had not happened, or missed.
+  assert.deepEqual(runConfiguredServers("10.0.0.1, 10.0.0.1"),
+    [{ host: "10.0.0.1", label: "" }])
+  // First mention wins, so the name you gave it survives.
+  assert.deepEqual(runConfiguredServers("10.0.0.1=Big Box, 10.0.0.1=Other"),
+    [{ host: "10.0.0.1", label: "Big Box" }])
+  // A port makes it a different endpoint, and stays separate.
+  assert.equal(runConfiguredServers("10.0.0.1, 10.0.0.1:8000").length, 2)
+  // Ordinary lists are untouched.
+  assert.equal(runConfiguredServers("10.0.0.1, 10.0.0.2, 10.0.0.3").length, 3)
+})
+
+test("the panel publishes every verb the base Panel does", () => {
+  // Replacing the base handler quietly dropped show and hide, which every
+  // shipped plugin has.
+  const panel = fs.readFileSync(path.join(__dirname, "..", "Panel.qml"), "utf8")
+  const base = fs.readFileSync("/usr/share/omarchy/shell/Ui/Panel.qml", "utf8")
+  const verbs = (src) => new Set((src.match(/function (\w+)\(\): void/g) || [])
+    .map(m => m.match(/function (\w+)/)[1]))
+  const ours = verbs(panel), theirs = verbs(base)
+  for (const v of theirs) {
+    assert.ok(ours.has(v), `the base Panel publishes ${v}() and this one does not`)
+  }
+})
+
+test("a fractional token delta is rounded before it is shown", () => {
+  // TGI's work counter is a histogram _sum and is genuinely a float, so a
+  // delta arrives as 3.000000000000001 -- rendered literally, and at 31
+  // characters wider than the column had been sized for.
+  const messy = Model.activityBetween({ work: 1.0 }, { work: 4.000000000000001 })
+  assert.equal(Model.stateLabel({ reachable: true, activity: messy }), "working  3 tok")
+  // Under a whole token there is no count worth printing.
+  assert.equal(Model.stateLabel({ reachable: true, activity: { active: true, amount: 0.4 } }),
+    "working")
+  // Whole numbers are unchanged.
+  assert.equal(Model.stateLabel({ reachable: true, activity: { active: true, amount: 42 } }),
+    "working  42 tok")
+  // And the state column is still sized for what it can hold.
+  assert.ok("working  9999 tok".length >= "working  3 tok".length)
+})

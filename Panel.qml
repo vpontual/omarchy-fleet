@@ -76,6 +76,10 @@ Panel {
     function open(): void { root.open() }
     function close(): void { root.close() }
     function toggle(): void { root.toggle() }
+    // The base Panel publishes these alongside open/close/toggle, and every
+    // shipped plugin has them; replacing the handler quietly dropped both.
+    function show(): void { root.open() }
+    function hide(): void { root.close() }
     function refresh(): string { fleet.refresh(); return "ok" }
     function busy(): string { return fleet.busy ? "busy" : "idle" }
     function diagnostics(): string { return fleet.diagnosticsJson() }

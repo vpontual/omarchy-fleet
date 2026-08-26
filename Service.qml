@@ -67,11 +67,17 @@ Item {
   // call, and it is called from a binding (`Instantiator.model`) and from
   readonly property var configured: {
     var parsed = Model.parseServers(serversSetting)
-    var out = [], rejected = []
+    var out = [], rejected = [], seen = {}
     for (var i = 0; i < parsed.length; i++) {
       var h = parsed[i].host.replace(/^https?:\/\//, "").replace(/\/.*$/, "")
       if (h === "") continue
       if (!Model.isSafeHost(h)) { rejected.push(h); continue }
+      // First mention wins. Two entries for one host share a single _state
+      // key, so the second result of each cycle overwrote the first's sample
+      // and the activity delta was measured against the wrong reading -- the
+      // node reported work it had not done, or missed work it had.
+      if (seen[h]) continue
+      seen[h] = true
       out.push({ host: h, label: parsed[i].label })
     }
     return { servers: out, rejected: rejected }

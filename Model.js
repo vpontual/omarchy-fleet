@@ -452,8 +452,12 @@ function stateLabel(node) {
   if (node.canReportActivity === false) return "no activity signal"
   if (node.firstReading) return "measuring"
   if (node.activity && node.activity.active) {
-    return typeof node.activity.amount === "number" && node.activity.amount > 0
-      ? "working  " + node.activity.amount + " tok"
+    // Rounded for display only. TGI's work counter is a histogram _sum and is
+    // genuinely a float, so a delta arrives as 3.000000000000001 -- which
+    // rendered literally, and at 31 characters was wider than the column had
+    // been sized for. The unrounded value stays in diagnostics.
+    return typeof node.activity.amount === "number" && node.activity.amount >= 1
+      ? "working  " + Math.round(node.activity.amount) + " tok"
       : "working"
   }
   return "idle"

@@ -146,6 +146,18 @@ omarchy plugin remove veepee.fleet
 Remove the widget from your bar first if you added it. Nothing is left behind —
 the plugin writes no files and installs nothing.
 
+## Keys and clicks
+
+| | |
+|---|---|
+| click the bar icon | open or close the panel |
+| middle-click the bar icon | refresh now, without opening it |
+| `r` while the panel is open | refresh |
+| `Esc` | close |
+
+Over IPC: `open`, `close`, `show`, `hide`, `toggle`, `refresh`, `busy`,
+`diagnostics`.
+
 ## Troubleshooting
 
 ```sh
@@ -163,7 +175,7 @@ curl -sSf http://YOUR_SERVER:8000/metrics | head
 ## Development
 
 ```sh
-npm test                      # 67 tests, no dependencies
+npm test                      # 70 tests, no dependencies
 omarchy plugin validate .
 ```
 
