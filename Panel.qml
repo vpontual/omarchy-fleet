@@ -38,16 +38,12 @@ Panel {
   readonly property bool configured: fleet.configuredHosts().length > 0
   readonly property bool nothingReachable: configured && fleet.fleet.up === 0
 
-  // The headline. Deliberately says "measuring" until every node has produced
-  // two readings: activity is a counter delta, so before that the widget has
-  // not observed an idle fleet -- it has observed nothing at all.
-  readonly property string headline: {
-    if (!configured) return "No servers configured"
-    if (nothingReachable) return "No servers reachable"
-    if (!fleet.baselineReady) return "Measuring"
-    if (fleet.busy) return fleet.fleet.active === 1 ? "1 server working" : fleet.fleet.active + " servers working"
-    return "Idle"
-  }
+  // Deliberately says "Measuring" until every node has produced two readings:
+  // activity is a counter delta, so before that the widget has not observed an
+  // idle fleet, it has observed nothing at all. One definition, in Model.js,
+  // for the same reason stateLabel lives there.
+  readonly property string headline:
+    Model.headline(fleet.fleet, configured, fleet.baselineReady)
 
   readonly property string detail: {
     // A rejected address comes FIRST: a typo used to drop the server silently,

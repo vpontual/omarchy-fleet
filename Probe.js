@@ -8,6 +8,40 @@
 // rather than the code. Both of the plugin's blocking defects were found in
 // exactly that unreachable region.
 
+// How long one request may take, and how many a script may make.
+//
+// These two facts have to agree with the kill timer wrapping the script, and
+// for a while they did not: discovery made fifteen requests at four seconds
+// each -- sixty seconds of budget -- under a twelve-second
+// `timeout --signal=KILL`. Measured, with one unresponsive port ahead of a
+// live one, the sweep was killed at 12.006s having never reached the second
+// port. Any host not answering promptly on 8000 could not be discovered AT
+// ALL, and was drawn "unreachable" while serving. The README advertised both
+// numbers in adjacent sentences without noticing.
+//
+// So the budget is now DERIVED from the script rather than written beside it,
+// and a test asserts the derivation covers the worst case.
+var KNOWN_MAX_TIME = 4
+var DISCOVERY_MAX_TIME = 2      // 15 requests, so each must be cheap
+var CONNECT_TIMEOUT = 1         // a filtered port hangs here, not at max-time
+var ENDPOINTS_PER_PORT = 3      // /metrics, /api/ps, /v1/models
+var SLACK_SEC = 3               // process start, grep, the shell itself
+
+// Requests this script can make, worst case.
+function _requests(Model, host, known) {
+  if (known && known.port && known.runtime) return 2   // read, then liveness
+  var addr = Model.splitHostPort(String(host || ""))
+  var ports = addr.port ? 1 : Model.PORT_CANDIDATES.length
+  return ports * ENDPOINTS_PER_PORT
+}
+
+// The deadline to wrap this script in. Never smaller than what it can spend.
+function budgetSec(Model, host, known) {
+  var perRequest = (known && known.port && known.runtime)
+    ? KNOWN_MAX_TIME : DISCOVERY_MAX_TIME
+  return _requests(Model, host, known) * perRequest + SLACK_SEC
+}
+
 function script(Model, host, known) {
   // -f so a non-2xx yields an EMPTY body. Without it, Ollama's own
   // "404 page not found" page at /metrics is a non-empty body, which made
@@ -16,7 +50,21 @@ function script(Model, host, known) {
   // Declared before any branch: the known-node path returns early, and it
   // rendered "head -c undefined" while this sat further down.
   var n = Model.MAX_PROBE_BYTES
-  var curl = "curl -sSf --max-time 4"
+  var known2xx = known && known.port && known.runtime
+  var maxTime = known2xx ? KNOWN_MAX_TIME : DISCOVERY_MAX_TIME
+  // --connect-timeout because a DROP-policy firewall hangs at connect, where
+  // --max-time is not the binding constraint. It is what keeps a fifteen-port
+  // sweep against a filtered host inside its budget.
+  var curl = "curl -sSf --connect-timeout " + CONNECT_TIMEOUT + " --max-time " + maxTime
+  // The liveness check deliberately drops -f. Its question is "did anything
+  // answer", not "did it answer with a body worth reading" -- and -f turns
+  // every non-2xx into an empty reply, which is exactly what a dead host
+  // produces. So a vLLM behind an auth proxy (401), or one whose /metrics
+  // 500s while the engine happily serves, was drawn urgent-red "unreachable",
+  // indistinguishable from a box that lost power. --head because a body we
+  // have already decided not to read is bytes we do not need.
+  var alive = "curl -sS --head --connect-timeout " + CONNECT_TIMEOUT +
+              " --max-time " + maxTime
   var prefixes = []
   for (var key in Model.RUNTIMES) {
     if (Model.RUNTIMES[key].detect) prefixes.push(Model.RUNTIMES[key].detect)
@@ -37,10 +85,11 @@ function script(Model, host, known) {
 
   if (known && known.port) {
     var rt = Model.runtimeOf(known.runtime)
-    // A cached runtime that is no longer in the table. Latent -- markers come
-    // from our own echo -- but the blast radius is the wedge this file already
-    // documents: the throw escapes refresh() after probing is set, no process
-    // starts, and every later refresh returns early. Forever.
+    // A cached runtime with no adapter. Not reachable today -- the runtime name
+    // is echoed by our own marker, so it can only be one this file wrote -- but
+    // dereferencing null here would throw out of refresh() with `probing`
+    // already true, and every later cycle returns early on it. Forever. An
+    // empty script instead yields an empty reply and an honest "unreachable".
     if (!rt) return ""
     var url = "http://" + addr.host + ":" + known.port + rt.probe
     // 2>/dev/null like every other curl here: -sS keeps error text for a human
@@ -76,7 +125,12 @@ function script(Model, host, known) {
            "if [ -n \"$b\" ]; then\n" +
            "  " + markers + "\n" +
            "  printf '%s' \"$b\"\n" +
-           "elif " + curl + " -o /dev/null " + url + " 2>/dev/null; then\n" +
+           // >/dev/null as well as -o /dev/null: this curl's stdout joins the
+           // script's, AHEAD of the markers, so anything it printed would be
+           // parsed as the node's body. -o is what makes it silent today, and
+           // one flag standing between an error page and a forged sample is
+           // one too few.
+           "elif " + alive + " -o /dev/null " + url + " >/dev/null 2>&1; then\n" +
            "  " + markers + "\n" +
            "  echo NOSAMPLE\n" +
            "fi\n" +

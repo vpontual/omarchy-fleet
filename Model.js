@@ -12,7 +12,6 @@
 // catches it. Verified against a live server: one 2-token completion moved
 // vllm:generation_tokens_total from 48456 to 48458.
 
-var PROBE_TIMEOUT_SEC = 12
 
 // Hard ceiling on what any probe may hand back, applied in the shell BEFORE
 // the bytes reach QML.
@@ -312,17 +311,27 @@ function readSample(runtimeName, body) {
 
 // Did this node do work between two samples?
 //
-// Returns { active, amount } where amount is tokens generated when the
-// runtime counts them, and null when it can only say yes/no. A counter that
-// goes BACKWARDS means the server restarted and reset it; that is not
-// negative work, and reporting it as activity would light the widget on every
-// restart.
+// Returns { active, amount } -- amount being tokens generated where the
+// runtime counts them and null where it can only say yes/no -- or NULL for
+// "these two samples cannot be compared", which is not the same answer and
+// must not share a shape with one.
+//
+// It used to return { active: false, amount: null } for both, and stateLabel
+// renders that as "idle". So a vLLM engine restart, which resets the counter
+// and yields a negative delta, drew a bold green "idle" over its own
+// `4 running  2 queued  90% cache` -- while it was serving four requests. A
+// counter that reappears after a poll where the exporter omitted it did the
+// same, hiding every token generated in between. Both are the one case this
+// function genuinely cannot answer, and the caller turns null into
+// "measuring", which clears itself on the next comparable pair.
 function activityBetween(prev, curr) {
-  if (!prev || !curr) return { active: false, amount: null }
+  if (!prev || !curr) return null
 
   if (curr.work !== null && prev.work !== null) {
     var delta = curr.work - prev.work
-    if (delta < 0) return { active: false, amount: null, reset: true }
+    // Backwards means the server restarted and reset it. Not negative work,
+    // and not evidence of no work either.
+    if (delta < 0) return null
     return { active: delta > 0, amount: delta }
   }
 
@@ -330,7 +339,7 @@ function activityBetween(prev, curr) {
     return { active: curr.token !== prev.token, amount: null }
   }
 
-  return { active: false, amount: null }
+  return null
 }
 
 // ── Fleet roll-up ─────────────────────────────────────────────────────
@@ -454,7 +463,14 @@ function splitHostPort(spec) {
 // is interpolated into a curl invocation, so anything that could end the
 // argument or start another command must be impossible.
 function isSafeHost(host) {
-  return /^[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]{1,5})?$/.test(String(host || ""))
+  var text = String(host || "")
+  if (!/^[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]{1,5})?$/.test(text)) return false
+  // {1,5} digits reaches 99999, above the 65535 splitHostPort clamps to -- so
+  // `host:99999` was accepted here, probed as a URL no server can answer, and
+  // reported "unreachable" rather than rejected with the config error the user
+  // needed to see.
+  var addr = splitHostPort(text)
+  return addr.port === null || (addr.port >= 1 && addr.port <= 65535)
 }
 
 // What a row is allowed to claim about a node, in order of honesty.
@@ -476,6 +492,49 @@ function stateLabel(node) {
       : "working"
   }
   return "idle"
+}
+
+// What the table currently says, as one string.
+//
+// Compared against the last published one so an unchanged fleet is not
+// republished: a JS-array Repeater model has no diffing, so reassigning it
+// rebuilds every row -- and a quiet fleet produces identical rows every few
+// seconds, forever, in the process that draws the desktop.
+//
+// It covers exactly what a row RENDERS. Deliberately not the sample or the
+// timestamps: those change constantly without changing a pixel, which would
+// make the whole comparison pointless.
+function signature(nodes) {
+  var parts = []
+  for (var i = 0; i < (nodes || []).length; i++) {
+    var n = nodes[i]
+    parts.push([n.host, n.label, n.runtime, n.port, stateLabel(n),
+                n.model, n.running, n.waiting, n.cache].join("\u0001"))
+  }
+  return parts.join("\u0002")
+}
+
+// The panel's headline, in the same order of honesty as stateLabel.
+//
+// It lived in Panel.qml as a binding, where only a source extractor could
+// reach it -- and it went wrong in the way that region always goes wrong. It
+// consulted `busy` and `baselineReady` but never `unknown`, which fleetState
+// computes for exactly this purpose, so a fleet of one OpenAI-compatible node
+// (a runtime this file marks as unable to report activity) read "Idle" in the
+// panel's largest type, directly above the line "1 server cannot report
+// activity".
+function headline(fleet, configured, baselineReady) {
+  if (!configured) return "No servers configured"
+  if (!fleet || fleet.up === 0) return "No servers reachable"
+  if (!baselineReady) return "Measuring"
+  if (fleet.busy) {
+    return fleet.active === 1 ? "1 server working" : fleet.active + " servers working"
+  }
+  // Nothing that could speak reported work. Saying "Idle" would be a claim
+  // about servers that were never able to make one.
+  if (fleet.unknown >= fleet.up) return "No activity signal"
+  if (fleet.unknown > 0) return "Idle where it can tell"
+  return "Idle"
 }
 
 // A node record before anything has been read, carrying forward only what a

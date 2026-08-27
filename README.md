@@ -134,8 +134,15 @@ answers, because the port is remembered.
 The wrapper exists because Quickshell's output collector has no size limit of
 its own. It bounds the **whole script's** output at 64 KiB with `head -c` — one
 ceiling around everything, not one per branch, so no request can exceed it
-however the script grows — gives the whole call a 12-second deadline with
-`timeout`, and clears `BASH_ENV`/`ENV` so nothing is sourced on the way in.
+however the script grows — gives the whole call a deadline with `timeout`, and
+clears `BASH_ENV`/`ENV` so nothing is sourced on the way in.
+
+That deadline is **derived from the script**, not a constant written beside it:
+a known server gets 11 seconds for its two requests, a full sweep 33 for its
+fifteen, and a test asserts the arithmetic covers the worst case. It did not,
+once — fifteen requests at four seconds each under a twelve-second kill — so a
+host that did not answer promptly on port 8000 was killed mid-sweep and drawn
+"unreachable" while it was serving.
 Every address is validated before it reaches that string, and everything drawn
 from a server's response is rendered as plain text, never as markup.
 
@@ -182,7 +189,7 @@ curl -sSf http://YOUR_SERVER:8000/metrics | head
 ## Development
 
 ```sh
-npm test                      # 87 tests, no dependencies
+npm test                      # 97 tests, no dependencies
 omarchy plugin validate .
 ```
 

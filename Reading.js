@@ -40,9 +40,19 @@ function apply(Model, Probe, host, label, out, prev, now) {
       // legitimately has no counter and signals through `token`, so checking
       // only `work` marked every healthy Ollama node as unable to report
       // activity. Caught by looking at a real one.
-      if (sample.work === null && !sample.token) node.canReportActivity = false
-      else if (prev.sample) node.activity = Model.activityBetween(prev.sample, sample)
-      else node.firstReading = true
+      if (sample.work === null && !sample.token) {
+        node.canReportActivity = false
+      } else if (prev.sample) {
+        // null means the pair could not be compared -- a restarted counter, or
+        // one the exporter omitted last poll. Saying "idle" there is a claim
+        // about work that was never measured; "measuring" is the truth, and
+        // the next comparable pair clears it.
+        var moved = Model.activityBetween(prev.sample, sample)
+        if (moved) node.activity = moved
+        else node.firstReading = true
+      } else {
+        node.firstReading = true
+      }
     }
 
     // Cache what was DETECTED, whether or not a sample parsed. Caching only on

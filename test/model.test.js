@@ -11,7 +11,7 @@ const source = fs.readFileSync(path.join(__dirname, "..", "Model.js"), "utf8")
 const Model = new Function(
   source +
     "; return { RUNTIMES, PORT_CANDIDATES, runtimeOf, detectFromMetrics, sumMetric," +
-    " readSample, activityBetween, fleetState, isSafeHost, MAX_PROBE_BYTES, parseServers, stripLabel, MAX_LABEL, splitHostPort, PROBE_TIMEOUT_SEC, modelFromMetrics, shortModelName, avgMetric, stateLabel, blankNode, nodeSummary, clampField, stripControl, MAX_MESSAGE }"
+    " readSample, activityBetween, fleetState, isSafeHost, MAX_PROBE_BYTES, parseServers, stripLabel, MAX_LABEL, splitHostPort, modelFromMetrics, shortModelName, avgMetric, stateLabel, headline, signature, blankNode, nodeSummary, clampField, stripControl, MAX_MESSAGE }"
 )()
 
 // Captured verbatim from a live vLLM node (DGX Spark), trimmed to the series
@@ -128,13 +128,48 @@ test("no change means idle", () => {
   assert.deepEqual(Model.activityBetween(a, a), { active: false, amount: 0 })
 })
 
-test("a counter going backwards is a restart, not negative work", () => {
+test("a restart is not negative work, and not evidence of no work", () => {
   // Reporting it as activity would flash the light on every server restart.
+  // Reporting it as { active: false } is worse: stateLabel renders that as
+  // "idle", so a vLLM engine that had just restarted was drawn bold green
+  // "idle" over its own "4 running  2 queued  90% cache".
   const a = Model.readSample("vllm", VLLM)
   const b = Model.readSample("vllm", VLLM.replace("48456.0", "12.0"))
-  const r = Model.activityBetween(a, b)
-  assert.equal(r.active, false)
-  assert.equal(r.reset, true)
+  assert.strictEqual(Model.activityBetween(a, b), null,
+    "an uncomparable pair produced an answer about work")
+
+  // End to end: a restarted node says "measuring", not "idle", and keeps
+  // reporting the numbers it can actually support.
+  const busy = VLLM.replace("48456.0", "12.0")
+                   .replace(/(vllm:num_requests_running[^ ]*) 0\.0/, "$1 4.0")
+  const res = readingOf("PORT 8000\nRT vllm\n" + busy,
+                        { runtime: "vllm", port: 8000, sample: a })
+  assert.equal(Model.stateLabel(res.node), "measuring",
+    "a restarted server serving requests was drawn as idle")
+  assert.equal(res.node.running, 4, "the numbers it can support were dropped")
+
+  // And the next comparable pair clears it.
+  const after = readingOf("PORT 8000\nRT vllm\n" + VLLM, res.state)
+  assert.notEqual(Model.stateLabel(after.node), "measuring",
+    "measuring never clears")
+})
+
+test("a counter the exporter skipped does not become an idle claim", () => {
+  // A partial scrape -- the file's own comment calls it what a version skew
+  // produces -- left prev.work null. The next poll had both a real counter and
+  // a 500-token jump, and the widget said "idle".
+  const full = "vllm:generation_tokens_total{model=\"m\"} 1000\n"
+  const partial = "vllm:num_requests_running{model=\"m\"} 1\n"
+  const later = "vllm:generation_tokens_total{model=\"m\"} 1500\n"
+
+  const one = readingOf("PORT 8000\nRT vllm\n" + full, {})
+  const two = readingOf("PORT 8000\nRT vllm\n" + partial, one.state)
+  assert.equal(Model.stateLabel(two.node), "no activity signal")
+
+  const three = readingOf("PORT 8000\nRT vllm\n" + later, two.state)
+  assert.notEqual(Model.stateLabel(three.node), "idle",
+    "500 generated tokens were reported as an idle server")
+  assert.equal(Model.stateLabel(three.node), "measuring")
 })
 
 test("ollama activity comes from the keep-alive expiry CHANGING", () => {
@@ -237,7 +272,7 @@ const SERVICE = fs.readFileSync(path.join(__dirname, "..", "Service.qml"), "utf8
 // extractor, no brace matching, no chance of an assertion matching a comment.
 const Probe = new Function(
   fs.readFileSync(path.join(__dirname, "..", "Probe.js"), "utf8") +
-  "; return { script, parse }"
+  "; return { script, parse, budgetSec }"
 )()
 
 // Reading.js is plain JS too, so the honesty rules load and RUN.
@@ -499,8 +534,6 @@ test("a probe is bounded as a whole, not just per request", () => {
   // five candidate ports times three endpoints. A host that drops packets
   // rather than refusing them had no overall bound, and the 15s watchdog only
   // resets the plugin's flags -- the processes carry on.
-  assert.ok(Model.PROBE_TIMEOUT_SEC > 0 && Model.PROBE_TIMEOUT_SEC < 15,
-    "the probe bound must fire before the 15s watchdog")
   const argv = SERVICE.match(/proc\.command = \[[\s\S]*?\]/)
   assert.ok(argv, "the probe command could not be found")
   const cmd = argv[0]
@@ -776,7 +809,7 @@ test("a late result from an abandoned cycle is discarded", () => {
   assert.ok(finish.indexOf("cycle !== _cycle") < finish.indexOf("_pending--"),
     "the fence must come before _pending is touched")
   // The watchdog must invalidate what it abandons.
-  const wd = SERVICE.slice(SERVICE.indexOf("probe cycle did not finish"))
+  const wd = SERVICE.slice(SERVICE.indexOf("overran its"))
   assert.ok(/_cycle\+\+/.test(wd.slice(0, 300)),
     "the watchdog abandons a cycle without invalidating it")
 })
@@ -940,17 +973,62 @@ test("the ceilings are sane values, not merely referenced ones", () => {
   assert.ok(Model.MAX_PROBE_BYTES >= 4096 && Model.MAX_PROBE_BYTES <= 1048576,
     "a ceiling this size is not a ceiling")
 
-  // The probe bound must fire before the 15s watchdog, with room to spare --
-  // 14 races it.
-  assert.ok(Model.PROBE_TIMEOUT_SEC <= 13,
-    `${Model.PROBE_TIMEOUT_SEC}s races the 15s watchdog`)
-  assert.ok(Model.PROBE_TIMEOUT_SEC >= 5, "too short to survive a slow first sweep")
-
-  // And each individual request stays bounded too.
-  const script = renderProbe("10.0.0.1", null)
+  // Each individual request stays bounded too.
+  const script = renderProbe("192.0.2.10", null)
   assert.ok(/--max-time \d+/.test(script), "curl has no per-request time bound")
   const t = parseInt(script.match(/--max-time (\d+)/)[1])
   assert.ok(t >= 1 && t <= 10, `--max-time ${t} is not a bound`)
+})
+
+// What a script can spend, read back out of the script itself rather than
+// taken on trust from the constants that generated it.
+function worstCaseSec(script) {
+  const perRequest = parseInt(script.match(/--max-time (\d+)/)[1], 10)
+  const loop = script.match(/for p in ([^;]+); do([\s\S]*?)\ndone/)
+  const requests = loop
+    ? loop[1].trim().split(/\s+/).length * (loop[2].match(/curl /g) || []).length
+    : (script.match(/curl /g) || []).length
+  return { perRequest: perRequest, requests: requests, total: perRequest * requests }
+}
+
+test("a probe's deadline covers what the probe can actually spend", () => {
+  // This exact arithmetic was wrong, and nothing noticed: discovery made
+  // fifteen requests at four seconds each -- sixty seconds -- under a
+  // twelve-second `timeout --signal=KILL`. Measured with one unresponsive port
+  // ahead of a live one, the sweep was KILLed at 12.006s having never reached
+  // the second port, so a host that did not answer promptly on 8000 could not
+  // be discovered at all and was drawn "unreachable" while serving.
+  const cases = [
+    ["192.0.2.10", { port: 8000, runtime: "vllm" }, "a known node"],
+    ["192.0.2.10:8000", null, "an explicit port"],
+    ["192.0.2.10", null, "a full sweep"],
+  ]
+  for (const [host, known, what] of cases) {
+    const spend = worstCaseSec(Probe.script(Model, host, known))
+    const budget = Probe.budgetSec(Model, host, known)
+    assert.ok(budget >= spend.total,
+      `${what}: ${spend.requests} requests x ${spend.perRequest}s = ` +
+      `${spend.total}s under a ${budget}s kill`)
+    // And not absurdly generous either, or it is not a deadline. Both bounds
+    // are needed: budget and spend are derived from the same constants, so
+    // relative checks alone move together and catch nothing. This one is
+    // absolute -- the widget refreshes every few seconds, and a deadline the
+    // user waits a minute for is a hang with a timer on it.
+    assert.ok(budget <= spend.total + 10, `${what}: ${budget}s is not a deadline`)
+    assert.ok(budget <= 40, `${what}: a ${budget}s probe stalls the whole panel`)
+  }
+
+  // A filtered port hangs at connect, where --max-time is not what binds.
+  assert.ok(/--connect-timeout \d+/.test(Probe.script(Model, "192.0.2.10", null)),
+    "a host that drops packets is bounded only by --max-time")
+
+  // The watchdog must outlast the slowest probe of the cycle, or it abandons
+  // a sweep that was still inside its own deadline.
+  const svc = codeOf("Service.qml")
+  assert.ok(/probeWatchdog\.interval = \(budget \+ \d+\) \* 1000/.test(svc),
+    "the watchdog is a fixed interval again, not the cycle's own budget")
+  assert.ok(/Math\.max\(budget, Probe\.budgetSec\(/.test(svc),
+    "the watchdog takes one host's budget, not the slowest")
 })
 
 test("the runtime table and the port sweep cannot drift apart", () => {
@@ -1156,10 +1234,18 @@ test("the row does not measure for itself", () => {
 test("an unknown column measures nothing rather than the wrong thing", () => {
   // _widest dispatched on a string with the runtime label as its default, so a
   // typo silently measured the wrong field.
-  const src = fs.readFileSync(path.join(__dirname, "..", "ColumnWidths.qml"), "utf8")
-  const fn = src.slice(src.indexOf("function _widest"))
-  assert.ok(/else \{\s*\n\s*return ""/.test(fn),
+  const src = codeOf("ColumnWidths.qml")
+  const fn = src.slice(src.indexOf("function _values"), src.indexOf("function _widest"))
+  assert.ok(/else \{\s*\n\s*return \[\]/.test(fn),
     "an unknown column name still falls through to a default")
+
+  // And the column is measured by measuring, not by counting characters:
+  // "no activity signal" is longer than "working  9999 tok" and narrower.
+  const measure = src.slice(src.indexOf("function _widest"))
+  assert.ok(/metrics\.text = values\[i\]/.test(measure),
+    "only one candidate per column is measured")
+  assert.ok(!/\.length > best\.length/.test(measure),
+    "the widest value is still chosen by character count")
 })
 
 test("stateLabel is one definition, used by both the row and the measurement", () => {
@@ -1375,11 +1461,79 @@ test("an error page is not a reading", () => {
       { env: { ...process.env, PATH: dir + ":" + process.env.PATH },
         encoding: "utf8", timeout: 20000 }).stdout || ""
 
-    assert.equal(run({ port: 8000, runtime: "vllm" }).trim(), "",
-      "a failed request was reported as a reading")
+    // The read is refused, so the series never becomes a sample. The node is
+    // still ANSWERING -- the liveness check drops -f precisely so a 5xx is not
+    // mistaken for a dead host -- so the honest row is "no activity signal".
+    const res = readingOf(run({ port: 8000, runtime: "vllm" }), {})
+    assert.equal(Model.stateLabel(res.node), "no activity signal",
+      "an error page was drawn as a healthy sample")
+    assert.strictEqual(res.state.sample, null, "an error page was cached as a sample")
+
+    // Discovery has no liveness fallback, so there it is simply not a find.
     assert.equal(run(null).trim(), "",
       "discovery accepted a failed request as an answer")
-    assert.equal(Probe.parse(Model, run({ port: 8000, runtime: "vllm" }), 9999), null)
+  } finally { fs.rmSync(dir, { recursive: true, force: true }) }
+})
+
+test("a server that answers is never drawn as unreachable", () => {
+  // The liveness check used to inherit -f from the read, and -f makes every
+  // non-2xx an empty reply -- the same thing a dead host produces. A vLLM
+  // behind an auth proxy, or one whose /metrics 500s while the engine serves,
+  // was drawn urgent-red "unreachable". The README promises the opposite.
+  //
+  // The server runs in a CHILD process on purpose: spawnSync blocks this one's
+  // event loop, so a server listening here could never answer the probe.
+  const cp = require("node:child_process")
+  const os = require("node:os")
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-http-"))
+  const portFile = path.join(dir, "port")
+
+  const serve = (code, headers, body) => {
+    fs.writeFileSync(path.join(dir, "srv.js"),
+      `const http = require("node:http"), fs = require("node:fs")\n` +
+      `const s = http.createServer((q, r) => { r.writeHead(${code}, ${JSON.stringify(headers)}); r.end(${JSON.stringify(body)}) })\n` +
+      `s.listen(0, "127.0.0.1", () => fs.writeFileSync(${JSON.stringify(portFile)}, String(s.address().port)))\n`)
+    if (fs.existsSync(portFile)) fs.unlinkSync(portFile)
+    const child = cp.spawn(process.execPath, [path.join(dir, "srv.js")], { stdio: "ignore" })
+    for (let i = 0; i < 100 && !fs.existsSync(portFile); i++) {
+      cp.spawnSync("/usr/bin/bash", ["-c", "sleep 0.05"])
+    }
+    assert.ok(fs.existsSync(portFile), "the stub server never came up")
+    return { child: child, port: parseInt(fs.readFileSync(portFile, "utf8"), 10) }
+  }
+
+  const probe = (port) => cp.spawnSync("/usr/bin/bash",
+    ["-c", Probe.script(Model, "127.0.0.1:" + port, { port: port, runtime: "vllm" })],
+    { encoding: "utf8", timeout: 20000 }).stdout || ""
+
+  try {
+    const cases = [
+      [401, { "www-authenticate": 'Basic realm="m"' }, ""],
+      [500, {}, "upstream failed"],
+      [200, {}, "<html>up and serving</html>"],
+    ]
+    for (const [code, headers, body] of cases) {
+      const s = serve(code, headers, body)
+      try {
+        const res = readingOf(probe(s.port), {})
+        assert.equal(res.node.reachable, true,
+          `HTTP ${code} was reported as unreachable`)
+        assert.equal(Model.stateLabel(res.node), "no activity signal",
+          `HTTP ${code} did not read as answered-but-unreadable`)
+      } finally { s.child.kill() }
+    }
+
+    // A 200 carrying real series still reads as a sample, or the above proves
+    // only that everything is called "answered".
+    const good = serve(200, {}, 'vllm:generation_tokens_total{model="m"} 5\n')
+    try {
+      const res = readingOf(probe(good.port), {})
+      assert.equal(Model.stateLabel(res.node), "measuring", "a real body stopped reading")
+    } finally { good.child.kill() }
+
+    // And nothing listening is still, correctly, unreachable.
+    assert.equal(readingOf(probe(9), {}).node.reachable, false,
+      "a dead port was reported as answering")
   } finally { fs.rmSync(dir, { recursive: true, force: true }) }
 })
 
@@ -1449,6 +1603,181 @@ test("a misdetection can be cleared without restarting the shell", () => {
   // And it must be reachable from outside.
   const panel = codeOf("Panel.qml")
   assert.ok(/function rediscover\(\): string/.test(panel), "rediscover is not exposed over IPC")
+})
+
+test("every state a row can show is pinned to the condition that earns it", () => {
+  // Both of the states that exist ONLY to avoid lying could be deleted from
+  // stateLabel with the suite green: inverting "unreachable" to "idle", and
+  // removing "measuring" entirely, each left 87/87 passing. The label was
+  // asserted for the states that make a claim and not for the two that
+  // withhold one -- exactly backwards.
+  const node = (over) => Object.assign(
+    Model.blankNode("192.0.2.10", "n", {}), { reachable: true }, over || {})
+
+  assert.equal(Model.stateLabel(node({ reachable: false })), "unreachable")
+  assert.equal(Model.stateLabel(node({ canReportActivity: false })), "no activity signal")
+  assert.equal(Model.stateLabel(node({ firstReading: true })), "measuring")
+  assert.equal(Model.stateLabel(node({ activity: { active: true, amount: 12 } })), "working  12 tok")
+  assert.equal(Model.stateLabel(node({ activity: { active: true, amount: null } })), "working")
+  assert.equal(Model.stateLabel(node()), "idle")
+  assert.equal(Model.stateLabel(null), "")
+
+  // Order matters as much as the strings: an unreachable node also carries
+  // whatever the last cycle left behind, so a later branch must not win.
+  assert.equal(Model.stateLabel(node({
+    reachable: false, firstReading: true, activity: { active: true, amount: 9 } })),
+    "unreachable", "a dead node was drawn as working")
+  assert.equal(Model.stateLabel(node({
+    canReportActivity: false, activity: { active: true, amount: 9 } })),
+    "no activity signal", "a node that cannot report was drawn as working")
+  assert.equal(Model.stateLabel(node({
+    firstReading: true, activity: { active: true, amount: 9 } })),
+    "measuring", "a first reading was drawn as a measured delta")
+
+  // Every one of them must be a state the row can actually reach.
+  const shown = ["unreachable", "no activity signal", "measuring", "working", "idle"]
+  const row = codeOf("NodeRow.qml") + codeOf("ColumnWidths.qml")
+  for (const st of shown) {
+    assert.ok(row.indexOf(st) > -1 || /Model\.stateLabel/.test(row),
+      `${st} is never rendered`)
+  }
+})
+
+test("the baseline gate holds the headline until every node has been compared", () => {
+  // `baselineReady` appeared ZERO times in this suite, though it is the only
+  // thing standing between "Measuring" and an "Idle" the widget has not
+  // earned. Its rule: any reachable node still on its first reading holds the
+  // whole fleet at Measuring.
+  const svc = codeOf("Service.qml")
+  const gate = svc.slice(svc.indexOf("var ready ="), svc.indexOf("baselineReady = ready") + 30)
+  assert.ok(gate.length > 30, "the baseline gate could not be found")
+  assert.ok(/nodes\[i\]\.reachable && nodes\[i\]\.firstReading/.test(gate),
+    "the gate no longer looks at whether a node has been compared yet")
+  assert.ok(/ready = false/.test(gate), "the gate cannot withhold readiness")
+  assert.ok(/var ready = nodes\.length > 0/.test(gate),
+    "an empty fleet would report a ready baseline")
+
+  // An unreachable node must not hold the fleet at Measuring forever -- it
+  // will never produce a first reading.
+  assert.ok(gate.indexOf("reachable") < gate.indexOf("firstReading"),
+    "an unreachable node holds the baseline open indefinitely")
+
+  // And the headline honours it.
+  assert.equal(Model.headline({ up: 1, unknown: 0, busy: false, active: 0 }, true, false),
+    "Measuring")
+})
+
+test("rows are published in a stable order", () => {
+  // Without the sort, row order follows whichever probe returned first, so the
+  // table reshuffles every 3 seconds under the cursor.
+  const svc = codeOf("Service.qml")
+  assert.ok(/_collected\.sort\(/.test(svc), "results are published unsorted")
+  const cmp = svc.slice(svc.indexOf("_collected.sort("))
+  assert.ok(/a\.host < b\.host/.test(cmp.slice(0, 120)),
+    "the sort key is not the one thing that identifies a row")
+})
+
+test("an unchanged fleet is not republished", () => {
+  // A JS-array Repeater model has no diffing, so reassigning it destroys and
+  // rebuilds every row. A quiet fleet produces identical rows every few
+  // seconds, forever, in the process that draws the desktop.
+  const node = (over) => Object.assign(
+    Model.blankNode("192.0.2.10", "n", {}), { reachable: true }, over || {})
+
+  assert.equal(Model.signature([node()]), Model.signature([node()]),
+    "two identical tables have different signatures")
+
+  // Anything a row RENDERS must change it.
+  const base = Model.signature([node()])
+  for (const [field, value] of [["label", "other"], ["runtime", "ollama"],
+                                ["port", 9999], ["model", "qwen"],
+                                ["running", 3], ["waiting", 1], ["cache", 0.5],
+                                ["reachable", false], ["firstReading", true],
+                                ["canReportActivity", false]]) {
+    assert.notEqual(Model.signature([node({ [field]: value })]), base,
+      `a change to ${field} would not redraw the row`)
+  }
+  assert.notEqual(Model.signature([node(), node()]), base, "row count is not covered")
+
+  // And things a row does NOT render must not, or the comparison saves nothing.
+  const busy = node({ activity: { active: true, amount: 12 } })
+  assert.notEqual(Model.signature([busy]), base, "the state label is not covered")
+  assert.equal(Model.signature([node({ activity: { active: false, amount: null } })]), base,
+    "a reading that changed no visible value forced a redraw")
+
+  // The service must compare before assigning.
+  const svc = codeOf("Service.qml")
+  const at = svc.indexOf("nodes = _collected")
+  assert.ok(svc.slice(Math.max(0, at - 260), at).indexOf("Model.signature(") > -1,
+    "the table is republished without checking whether it changed")
+})
+
+test("a server removed from the settings is forgotten", () => {
+  // Its cached port, runtime and last sample lived on indefinitely, and came
+  // back -- sample included -- if the host was ever re-added.
+  const refresh = extractFunction("refresh")
+  assert.ok(/delete _state\[host\]/.test(refresh),
+    "state for a removed server is never dropped")
+  assert.ok(refresh.indexOf("live[servers[k].host]") < refresh.indexOf("delete _state[host]"),
+    "the prune runs before the set of live hosts is known")
+})
+
+test("an address is rejected for a port no server could answer on", () => {
+  // The pattern allowed five digits, which reaches 99999. Such an entry was
+  // accepted, probed as a URL nothing can serve, and drawn "unreachable" --
+  // instead of surfacing the config error the user needed to see.
+  assert.equal(Model.isSafeHost("192.0.2.10:8000"), true)
+  assert.equal(Model.isSafeHost("192.0.2.10:65535"), true)
+  assert.equal(Model.isSafeHost("192.0.2.10:99999"), false, "a port above 65535 was accepted")
+  assert.equal(Model.isSafeHost("192.0.2.10:0"), false, "port 0 was accepted")
+  assert.equal(Model.isSafeHost("192.0.2.10"), true, "a bare host was rejected")
+
+  // And such an entry reaches the user as a rejection.
+  const parsed = Model.parseServers("192.0.2.10:99999")
+  const rejected = parsed.filter(e => !Model.isSafeHost(e.host))
+  assert.equal(rejected.length, 1, "the bad address was not flagged")
+})
+
+test("the headline never claims idle for a fleet that cannot tell", () => {
+  // One OpenAI-compatible node -- the runtime the table itself marks
+  // noActivity -- read "Idle" in the panel's largest type, directly above
+  // "1 server cannot report activity". The count was already there; the
+  // headline never asked for it.
+  const openai = Model.blankNode("192.0.2.20", "lmstudio", { runtime: "openai" })
+  openai.reachable = true
+  openai.canReportActivity = false
+  const alone = Model.fleetState([openai])
+  assert.equal(alone.unknown, 1)
+  assert.equal(Model.headline(alone, true, true), "No activity signal",
+    "a fleet that cannot report activity was called idle")
+
+  // Mixed: one node genuinely idle, one that cannot say. Neither "Idle" nor
+  // "No activity signal" is the whole truth, and the headline must not pick
+  // the flattering half.
+  const quiet = Model.blankNode("192.0.2.21", "vllm", { runtime: "vllm" })
+  quiet.reachable = true
+  const mixed = Model.fleetState([openai, quiet])
+  assert.equal(Model.headline(mixed, true, true), "Idle where it can tell")
+
+  // An all-reporting quiet fleet still says Idle, or the above proves nothing.
+  assert.equal(Model.headline(Model.fleetState([quiet]), true, true), "Idle")
+
+  // And the earlier states still win, in order.
+  assert.equal(Model.headline(alone, false, true), "No servers configured")
+  assert.equal(Model.headline(Model.fleetState([]), true, true), "No servers reachable")
+  assert.equal(Model.headline(alone, true, false), "Measuring")
+
+  // Working outranks unknown: something demonstrably is doing work.
+  const busy = Model.blankNode("192.0.2.22", "vllm", { runtime: "vllm" })
+  busy.reachable = true
+  busy.activity = { active: true, amount: 12 }
+  assert.equal(Model.headline(Model.fleetState([openai, busy]), true, true),
+    "1 server working")
+
+  // The panel must use it rather than keeping a second copy.
+  const panel = codeOf("Panel.qml")
+  assert.ok(/Model\.headline\(/.test(panel), "Panel.qml does not use it")
+  assert.ok(!/return "Idle"/.test(panel), "Panel.qml still decides the headline itself")
 })
 
 test("the node record has one definition", () => {

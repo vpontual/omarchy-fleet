@@ -44,6 +44,8 @@ Item {
   property int _pending: 0
   // Incremented per refresh; a result carrying an older id is discarded.
   property int _cycle: 0
+  // What was last published, so an unchanged fleet is not republished.
+  property string _signature: ""
   property var _collected: []
 
   function setting(name, fallback) {
@@ -163,9 +165,23 @@ Item {
     // flickered in and out of the panel with nothing to say why.
     _cycle++
     probing = true
+    // Longer than the slowest probe this cycle can legitimately take, or it
+    // would abandon a sweep that was still within its own deadline.
+    var budget = 0
+    for (var b = 0; b < servers.length; b++) {
+      budget = Math.max(budget, Probe.budgetSec(Model, servers[b].host, _state[servers[b].host]))
+    }
+    probeWatchdog.interval = (budget + 2) * 1000
     probeWatchdog.restart()
     _collected = []
     _pending = servers.length
+    // Drop what we remember about servers no longer configured. Bounded by the
+    // config, so never large -- but a host removed from the settings kept its
+    // cached port, runtime and last sample indefinitely, and got them back if
+    // it was ever re-added, sample included.
+    var live = {}
+    for (var k = 0; k < servers.length; k++) live[servers[k].host] = true
+    for (var host in _state) { if (!live[host]) delete _state[host] }
     for (var i = 0; i < servers.length; i++) probeHost(servers[i].host, i, _cycle)
   }
 
@@ -174,7 +190,9 @@ Item {
   function probeHost(host, index, cycle) {
     var known = _state[host]
     var proc = probePool.objectAt(index)
-    if (!proc) { _finish(host, null); return }
+    // Fenced like every other result: without the id it would decrement
+    // whatever cycle happens to be current when it lands.
+    if (!proc) { _finish(host, null, cycle); return }
 
     // A straggler the watchdog abandoned may still be alive on this slot. The
     // fence stamps the process, not the result, so re-stamping it would credit
@@ -198,8 +216,13 @@ Item {
     // not a privilege boundary, since anything that can set it already runs as
     // this user, but this wrapper should not be a way into a shell it did not
     // intend to start.
+    // The deadline comes from the script, not from a constant sitting beside
+    // it: a discovery sweep can spend five times what a known-node read can,
+    // and the two disagreed badly enough that no host was discoverable unless
+    // it answered on the first candidate port.
     proc.command = ["/usr/bin/env", "-u", "BASH_ENV", "-u", "ENV",
-                    "/usr/bin/timeout", "--signal=KILL", String(Model.PROBE_TIMEOUT_SEC),
+                    "/usr/bin/timeout", "--signal=KILL",
+                    String(Probe.budgetSec(Model, host, known)),
                     "/usr/bin/bash", "-c", Probe.script(Model, host, known)]
     proc.running = true
   }
@@ -233,7 +256,16 @@ Item {
     _pending--
     if (_pending <= 0) {
       _collected.sort(function (a, b) { return a.host < b.host ? -1 : 1 })
-      nodes = _collected
+      // Assigning a fresh array re-runs every binding downstream, and a JS
+      // array model has no diffing -- so every NodeRow (a CursorSurface and
+      // five Texts) is destroyed and rebuilt, twenty times a minute, in the
+      // process that draws the whole desktop. A quiet fleet produces the same
+      // rows over and over, so most cycles have nothing to publish.
+      var next = Model.signature(_collected)
+      if (next !== _signature) {
+        _signature = next
+        nodes = _collected
+      }
       probing = false
       probeWatchdog.stop()
       var ready = nodes.length > 0
@@ -278,7 +310,8 @@ Item {
   // the backstop for the process itself failing to exit.
   Timer {
     id: probeWatchdog
-    interval: 15000
+    // Replaced per cycle by refresh(); this is only what it starts life with.
+    interval: 35000
     // Restarted by refresh(), so this is a deadline for THIS cycle rather than
     // a clock. Free-running, it fired at t=15, 30, 45... regardless of when a
     // cycle began -- so a cycle starting at 14.9s was abandoned 100ms in, and
@@ -287,7 +320,7 @@ Item {
     running: false
     onTriggered: {
       if (!root.probing) return
-      root._log("probe cycle did not finish within 15s; resetting")
+      root._log("probe cycle overran its " + probeWatchdog.interval + "ms deadline; resetting")
       // Bump the id so anything still running is fenced out when it lands.
       root._cycle++
       root.probing = false
