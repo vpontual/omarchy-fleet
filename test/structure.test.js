@@ -9,8 +9,8 @@ const { test } = require("node:test")
 const assert = require("node:assert")
 const fs = require("node:fs")
 const path = require("node:path")
-const { Text, codeOf, codeLines, sourceOf } = require("./harness.js")
-const { SERVICE } = require("./qml.js")
+const { Text, Fleet, codeOf, codeLines, sourceOf } = require("./harness.js")
+const { SERVICE, runPanelDetail } = require("./qml.js")
 
 test("the probe pool is an Instantiator, and callers address it as one", () => {
   // A Repeater can only create Items; Process is a plain QtObject, so the pool
@@ -135,8 +135,13 @@ test("no file has grown past the size it can be reviewed at", () => {
     "Service.qml": 340, "Panel.qml": 280, "NodeRow.qml": 210, "ColumnWidths.qml": 140,
     "FleetIcon.qml": 110,
     "lib/Runtimes.js": 180, "lib/Text.js": 90, "lib/Servers.js": 110,
-    "lib/Metrics.js": 230, "lib/Fleet.js": 300, "lib/Poll.js": 90,
-    "lib/Probe.js": 260, "lib/Reading.js": 110,
+    "lib/Metrics.js": 230, "lib/Fleet.js": 320, "lib/Poll.js": 90,
+    // Raised from 260 deliberately, not to silence the guard: the file took on
+    // telling probe FAILURES apart -- no curl on this machine, versus a server
+    // that accepted the connection and said nothing. Splitting it would put the
+    // script that writes the markers in one file and the parser that reads them
+    // in another, which is one protocol in two halves.
+    "lib/Probe.js": 285, "lib/Reading.js": 120,
   }
   for (const [file, max] of Object.entries(budgets)) {
     const n = sourceOf(file).trimEnd().split("\n").length
@@ -243,4 +248,43 @@ test("the row's own columns are bound to the widths it was given", () => {
   // And no column may carry a hardcoded pixel width.
   const literals = [...row.matchAll(/width:\s*(\d+)\s*$/gm)].map(m => m[1])
   assert.deepEqual(literals, [], `hardcoded column widths: ${literals}`)
+})
+
+test("the panel's second line explains what its headline just said", () => {
+  // Evaluated, not read: this is a chain of conditions in a QML binding, and
+  // the last review round found exactly that shape wrong twice. The order is
+  // the whole content -- several of these are true at once, and the first one
+  // that fires is the one the user is shown.
+  const node = (over) => Object.assign(
+    Fleet.blankNode("192.0.2.10", "n", {}), { read: true, reachable: true }, over || {})
+
+  assert.equal(runPanelDetail({ configured: false }),
+    "Add server addresses in the widget settings")
+
+  // A rejected address outranks everything: a typo used to shorten the fleet
+  // with nothing on screen to say why.
+  assert.equal(runPanelDetail({ configError: "Ignoring an unusable address: x|y" }),
+    "Ignoring an unusable address: x|y")
+
+  // A missing curl must come BEFORE the reachability line, which is also true
+  // here -- nothing was ever asked, so blaming the servers is a false claim
+  // about them and hides the one thing the user can fix.
+  const noTool = node({ reachable: false, probeTool: false })
+  assert.equal(runPanelDetail({ nodes: [noTool, noTool] }),
+    "Every server is probed with curl — install it to use this widget")
+
+  // With curl present, an all-down fleet does report how many it asked.
+  assert.equal(runPanelDetail({ nodes: [node({ reachable: false })] }),
+    "Checked 1 address")
+  assert.equal(runPanelDetail({ nodes: [node({ reachable: false }), node({ reachable: false })] }),
+    "Checked 2 addresses")
+
+  // Then the baseline, then the count that cannot report, then nothing.
+  assert.equal(runPanelDetail({ nodes: [node({ firstReading: true })] }),
+    "Establishing a baseline to compare against")
+  assert.equal(runPanelDetail({ nodes: [node({ canReportActivity: false })] }),
+    "1 server cannot report activity")
+  assert.equal(runPanelDetail({ nodes: [node({ canReportActivity: false }), node({ canReportActivity: false })] }),
+    "2 servers cannot report activity")
+  assert.equal(runPanelDetail({ nodes: [node()] }), "")
 })

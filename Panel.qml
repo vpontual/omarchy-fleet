@@ -57,6 +57,10 @@ Panel {
     // shorter fleet than the user configured with nothing to explain it.
     if (fleet.configError !== "") return fleet.configError
     if (!configured) return "Add server addresses in the widget settings"
+    // BEFORE nothingReachable, which is also true here and would blame the
+    // servers: with no curl there was no probe, so nothing was ever asked.
+    if (fleet.fleet.noTool > 0 && fleet.fleet.noTool === fleet.fleet.total)
+      return "Every server is probed with curl \u2014 install it to use this widget"
     if (nothingReachable) return "Checked " + fleet.fleet.total + " address" + (fleet.fleet.total === 1 ? "" : "es")
     if (!fleet.baselineReady) return "Establishing a baseline to compare against"
     if (fleet.fleet.unknown > 0)

@@ -1,22 +1,27 @@
 // Reaching into QML from a test.
 //
 // Nothing here is a good idea in isolation -- it parses a language with a
-// regex and a brace counter. It exists because QML cannot be loaded by
-// `node --test`, and the alternative was leaving the wiring between the panel,
-// its rows and the service unasserted entirely. Anything that can be moved
-// into lib/ and executed IS, and that migration is most of what the last two
-// review rounds produced; what is left are the parts that are irreducibly QML.
+// brace counter. It exists because QML cannot be loaded by `node --test`, and
+// the alternative was leaving the wiring between the panel, its rows and the
+// service unasserted entirely. Anything that can be moved into lib/ and
+// executed IS, and that migration is most of what the last two review rounds
+// produced; what is left are the parts that are irreducibly QML.
 
 const assert = require("node:assert")
-const { Servers, Text, sourceOf } = require("./harness.js")
+const { Servers, Text, Fleet, sourceOf } = require("./harness.js")
 
 const SERVICE = sourceOf("Service.qml")
+const PANEL = sourceOf("Panel.qml")
 
-// Brace-matching that is aware of strings, comments AND regex literals. The
-// comment case is not decoration: an apostrophe in a comment reads as an
-// unterminated string, and the extractor then swallows the rest of the file.
-function extractFunction(name) {
-  const src = SERVICE.slice(SERVICE.indexOf("function " + name))
+// The block that follows a marker, brace-matched.
+//
+// Aware of strings, comments AND regex literals. The comment case is not
+// decoration: an apostrophe inside one reads as an unterminated string, and
+// the extractor then swallows the rest of the file.
+function blockAfter(source, marker, what) {
+  const at = source.indexOf(marker)
+  assert.notEqual(at, -1, `${what} could not be found`)
+  const src = source.slice(at)
   let depth = 0, i = src.indexOf("{"), seen = false
   while (i < src.length) {
     const c = src[i], n = src[i + 1]
@@ -28,47 +33,51 @@ function extractFunction(name) {
     else if (c === "}") { depth--; if (seen && depth === 0) { i++; break } }
     i++
   }
-  return src.slice(0, i)
+  return { whole: src.slice(0, i), body: src.slice(src.indexOf("{"), i) }
 }
 
-function runConfiguredServers(setting) {
-  // The REAL binding body, so this cannot drift from what the plugin does.
-  // The parsing moved from a function into the `configured` property, so the
-  // extractor takes the property's expression block rather than a function.
-  const at = SERVICE.indexOf("readonly property var configured:")
-  assert.notEqual(at, -1, "the configured property could not be found")
-  const src = SERVICE.slice(at)
-  let depth = 0, i = src.indexOf("{"), seen = false
-  while (i < src.length) {
-    const c = src[i], n = src[i + 1]
-    if (c === "/" && n === "/") { const nl = src.indexOf("\n", i); i = nl === -1 ? src.length : nl; continue }
-    if (c === '"' || c === "'") { i++; while (i < src.length && src[i] !== c) i += src[i] === "\\" ? 2 : 1; i++; continue }
-    if (c === "/") { i++; while (i < src.length && src[i] !== "/") i += src[i] === "\\" ? 2 : 1; i++; continue }
-    if (c === "{") { depth++; seen = true }
-    else if (c === "}") { depth--; if (seen && depth === 0) { i++; break } }
-    i++
+function extractFunction(name) {
+  return blockAfter(SERVICE, "function " + name, `Service.qml's ${name}()`).whole
+}
+
+// Evaluate a QML property's expression block with `self` supplying everything
+// it reaches for. The REAL binding body, so a test cannot drift from what the
+// plugin does -- which is the entire reason for the machinery above.
+function runBinding(source, marker, what, self) {
+  const { body } = blockAfter(source, marker, what)
+  return new Function("self", `with (self) { return (function() ${body})() }`)(self)
+}
+
+// The `servers` setting, parsed by Service.qml's own `configured` binding.
+function runConfigured(setting) {
+  return runBinding(SERVICE, "readonly property var configured:",
+    "the configured property", { serversSetting: setting, Servers, Text })
+}
+function runConfiguredServers(setting) { return runConfigured(setting).servers }
+function runConfiguredRejects(setting) { return runConfigured(setting).rejected }
+
+// The panel's second line, which explains whatever the headline just said.
+// `fleet` here stands in for the Service; only what the binding reads matters.
+function runPanelDetail(state) {
+  const fleetState = Fleet.fleetState(state.nodes || [])
+  const self = {
+    Fleet: Fleet,
+    configured: state.configured !== false,
+    nothingReachable: Fleet.nothingReachable(fleetState, state.configured !== false),
+    fleet: {
+      configError: state.configError || "",
+      // DERIVED from the rows, as Service.qml derives it. Hardcoding it here
+      // would have made the baseline branch below untestable while looking
+      // tested, which is the failure mode this whole file exists to avoid.
+      baselineReady: state.baselineReady !== undefined
+        ? state.baselineReady : Fleet.baselineReady(state.nodes || []),
+      fleet: fleetState,
+    },
   }
-  const body = src.slice(src.indexOf("{"), i)
-  const self = { serversSetting: setting, Servers, Text }
-  return new Function("self", `with (self) { return (function() ${body})() }`)(self).servers
+  return runBinding(PANEL, "readonly property string detail:", "the detail property", self)
 }
 
-function runConfiguredRejects(setting) {
-  const at = SERVICE.indexOf("readonly property var configured:")
-  const src = SERVICE.slice(at)
-  let depth = 0, i = src.indexOf("{"), seen = false
-  while (i < src.length) {
-    const c = src[i], n = src[i + 1]
-    if (c === "/" && n === "/") { const nl = src.indexOf("\n", i); i = nl === -1 ? src.length : nl; continue }
-    if (c === '"' || c === "'") { i++; while (i < src.length && src[i] !== c) i += src[i] === "\\" ? 2 : 1; i++; continue }
-    if (c === "/") { i++; while (i < src.length && src[i] !== "/") i += src[i] === "\\" ? 2 : 1; i++; continue }
-    if (c === "{") { depth++; seen = true }
-    else if (c === "}") { depth--; if (seen && depth === 0) { i++; break } }
-    i++
-  }
-  const body = src.slice(src.indexOf("{"), i)
-  const self = { serversSetting: setting, Servers, Text }
-  return new Function("self", `with (self) { return (function() ${body})() }`)(self).rejected
+module.exports = {
+  SERVICE, PANEL, extractFunction,
+  runConfiguredServers, runConfiguredRejects, runPanelDetail,
 }
-
-module.exports = { SERVICE, extractFunction, runConfiguredServers, runConfiguredRejects }

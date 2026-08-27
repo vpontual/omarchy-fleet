@@ -196,3 +196,121 @@ test("a real sample beats a NOSAMPLE marker in the same body", () => {
     "a forged marker demoted a node that published a real reading")
   assert.equal(res.state.sample.work, 7, "the real reading was discarded")
 })
+
+test("a wedged server is not reported as a powered-off one", () => {
+  // Both time out, and both used to be the word "unreachable" -- while the
+  // README names "is it thinking, or did the server wedge?" as a question this
+  // plugin exists to answer. They are different problems with different fixes.
+  //
+  // The discriminator is curl's %{time_connect}: a server that ACCEPTS the
+  // connection and then says nothing gives exit 28 with a non-zero connect
+  // time, where a refused port gives exit 7 and a dropped packet gives exit 28,
+  // both with 0.000000. That is a property of curl, not of this code, so it is
+  // measured against a real socket rather than asserted about the script text.
+  //
+  // Child process on purpose: spawnSync blocks this one's event loop, so a
+  // listener here could never accept the probe's connection.
+  const cp = require("node:child_process")
+  const os = require("node:os")
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-wedged-"))
+  const portFile = path.join(dir, "port")
+  fs.writeFileSync(path.join(dir, "srv.js"),
+    `const net = require("node:net"), fs = require("node:fs")\n` +
+    // Accept, hold the socket open, never write a byte. A wedged engine.
+    `const held = []\n` +
+    `const s = net.createServer(c => held.push(c))\n` +
+    `s.listen(0, "127.0.0.1", () => fs.writeFileSync(${JSON.stringify(portFile)}, String(s.address().port)))\n`)
+  const child = cp.spawn(process.execPath, [path.join(dir, "srv.js")], { stdio: "ignore" })
+  try {
+    for (let i = 0; i < 100 && !fs.existsSync(portFile); i++) {
+      cp.spawnSync("/usr/bin/bash", ["-c", "sleep 0.05"])
+    }
+    assert.ok(fs.existsSync(portFile), "the wedged stub never came up")
+    const port = parseInt(fs.readFileSync(portFile, "utf8"), 10)
+
+    const run = (p) => cp.spawnSync("/usr/bin/bash",
+      ["-c", Probe.script("127.0.0.1:" + p, { port: p, runtime: "vllm" })],
+      { encoding: "utf8", timeout: 30000 }).stdout || ""
+
+    const wedged = run(port)
+    assert.equal(Probe.failure(wedged), "noanswer",
+      `a wedged server did not report NOANSWER: ${JSON.stringify(wedged)}`)
+    assert.equal(Fleet.stateLabel(readingOf(wedged, {}).node), "not responding")
+
+    // A refused port on the same host must still be plain unreachable, or the
+    // discriminator is not discriminating -- it is just always saying wedged.
+    const refused = run(port + 1 > 65535 ? port - 1 : port + 1)
+    assert.equal(Probe.failure(refused), null,
+      `a refused port reported a failure reason: ${JSON.stringify(refused)}`)
+    assert.equal(Fleet.stateLabel(readingOf(refused, {}).node), "unreachable")
+  } finally {
+    child.kill()
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("a missing curl blames the machine, not every server", () => {
+  // Every branch redirects curl's stderr to /dev/null, so "command not found"
+  // landed where nobody could see it and produced exactly what a dead host
+  // produces: the whole fleet drawn "unreachable", with the real cause -- one
+  // missing package on this machine -- nowhere on screen. The manifest
+  // declares no dependency, so the script is the only place to catch it.
+  for (const known of [{ port: 8000, runtime: "vllm" }, null]) {
+    const script = Probe.script("192.0.2.10", known)
+    assert.ok(/command -v curl/.test(script),
+      `${known ? "known-node" : "discovery"} probe does not check curl exists`)
+    // Before any request, or it is not a guard.
+    assert.ok(script.indexOf("command -v curl") < script.indexOf("curl -"),
+      "the check runs after the first request")
+  }
+
+  // Run it for real with a PATH that has everything except curl.
+  const cp = require("node:child_process")
+  const os = require("node:os")
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-nocurl-"))
+  const bin = path.join(dir, "bin")
+  fs.mkdirSync(bin)
+  for (const tool of ["bash", "grep", "head", "env", "timeout"]) {
+    const found = cp.spawnSync("command", ["-v", tool], { shell: true, encoding: "utf8" })
+      .stdout.trim()
+    if (found) fs.symlinkSync(found, path.join(bin, tool))
+  }
+  try {
+    assert.ok(!fs.existsSync(path.join(bin, "curl")), "the shim directory has curl in it")
+    const out = cp.spawnSync("/usr/bin/bash",
+      ["-c", Probe.script("192.0.2.10", { port: 8000, runtime: "vllm" })],
+      { encoding: "utf8", env: { PATH: bin }, timeout: 30000 }).stdout || ""
+    assert.equal(Probe.failure(out), "notool", `expected NOTOOL, got ${JSON.stringify(out)}`)
+
+    const node = readingOf(out, {}).node
+    assert.equal(node.probeTool, false)
+    assert.equal(Fleet.stateLabel(node), "no probe tool",
+      "a machine with no curl blamed the server instead")
+    assert.equal(Fleet.stateTone(node), "down")
+
+    // And the panel says it once, as a fact about this computer.
+    const fleet = Fleet.fleetState([node, node])
+    assert.equal(fleet.noTool, 2)
+    assert.equal(Fleet.headline(fleet, true, true), "curl is not installed",
+      "the headline blamed the servers for a missing package")
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("a failure reason is only read when nothing else parsed", () => {
+  // The markers are ours, but a server could put those words in a body. They
+  // are consulted only once parse() has found no reading at all, so the worst a
+  // forged one achieves is a differently-worded FAILURE -- never a claim that
+  // something is healthy, and never a state better than the truth.
+  const forged = "PORT 8000\nRT vllm\nvllm:generation_tokens_total 5\nNOANSWER\n"
+  const res = readingOf(forged, { sample: { work: 1, at: 0 } })
+  assert.equal(res.node.reachable, true, "a forged marker buried a real reading")
+  assert.equal(res.node.notResponding, false)
+  assert.equal(res.state.sample.work, 5)
+
+  assert.equal(Probe.failure(""), null)
+  assert.equal(Probe.failure("nothing recognisable"), null)
+  assert.equal(Probe.failure("NOANSWER"), "noanswer")
+  assert.equal(Probe.failure("NOTOOL"), "notool")
+})

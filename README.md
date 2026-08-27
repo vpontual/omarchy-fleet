@@ -98,12 +98,21 @@ Every state exists to keep the widget from saying something it has not measured.
 | `working  N tok` | the counter moved by N between two readings |
 | `measuring` | no comparable pair yet — first reading, a restarted counter, or a host not probed since you added it |
 | `no activity signal` | it answered, but published nothing that counts work |
-| `unreachable` | it was asked and did not answer |
+| `not responding` | it accepted the connection and then said nothing — wedged, not off |
+| `unreachable` | it was asked and did not answer at all |
+| `no probe tool` | `curl` is not installed here, so nothing could be asked |
 
 `measuring` and `no activity signal` are the two that matter: neither is `idle`,
 because an absence of evidence is not evidence of quiet. A server restart resets
 the token counter, and reading that negative delta as "no work" once drew a bold
 green `idle` over a node that was serving four requests.
+
+The last two are the same principle applied to failures, which were all one
+word until they were measured. A wedged engine and a powered-off box both time
+out; they are told apart by whether the TCP connection was accepted, which
+`curl` reports as a non-zero connect time. **That check runs once a server has
+been identified**, which is the steady state — a server that is wedged the very
+first time it is seen reads `unreachable` until it has answered once.
 
 ## Install
 
@@ -154,7 +163,9 @@ installed, and no service is started or stopped.**
 
 Per configured server, per refresh, it runs `curl` against that server inside a
 small `bash` wrapper, reads the response and displays numbers from it. That is
-the whole of it.
+the whole of it. `curl` is the only thing it needs that Omarchy does not
+guarantee; if it is missing the widget says so rather than reporting your fleet
+as down.
 
 Once a server has been identified that is **one** request — `/metrics` for the
 metrics-bearing runtimes, `/api/ps` for Ollama — and a second only when the
@@ -223,7 +234,7 @@ curl -sSf http://YOUR_SERVER:8000/metrics | head
 ## Development
 
 ```sh
-npm test                      # 104 tests, no dependencies
+npm test                      # 108 tests, no dependencies
 omarchy plugin validate .
 ```
 

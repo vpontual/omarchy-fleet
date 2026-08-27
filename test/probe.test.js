@@ -20,7 +20,16 @@ const { SERVICE, extractFunction } = require("./qml.js")
 // Count the worst case back OUT of the generated script, rather than trusting
 // the constants that produced it: budget and spend derive from the same
 // numbers, so a relative check moves with them and catches nothing.
+// `command -v curl` names curl without running it, so it is not a request and
+// not a thing to bound. Excluded by LINE rather than by narrowing the patterns
+// below: those are deliberately broad, because their job is to notice a curl
+// somebody adds later without thinking about ceilings.
+function withoutTheCurlPresenceCheck(script) {
+  return script.split("\n").filter(l => !/command -v curl/.test(l)).join("\n")
+}
+
 function worstCaseSec(script) {
+  script = withoutTheCurlPresenceCheck(script)
   const perRequest = parseInt(script.match(/--max-time (\d+)/)[1], 10)
   const loop = script.match(/for p in ([^;]+); do([\s\S]*?)\ndone/)
   const requests = loop
@@ -85,7 +94,7 @@ test("EVERY probe path is bounded, not just discovery", () => {
     // contains one bounded branch and two that were not, and the assertion was
     // satisfied by the bounded one while the other two printed an unfiltered
     // body straight to the collector.
-    const curls = script.match(/curl [^\n]*/g) || []
+    const curls = withoutTheCurlPresenceCheck(script).match(/curl [^\n]*/g) || []
     assert.ok(curls.length > 0, `${name} probe runs no curl at all`)
     for (const c of curls) {
       // A curl is acceptable if it is byte-bounded, OR if it discards its
