@@ -11,6 +11,7 @@ const fs = require("node:fs")
 const path = require("node:path")
 const { spawnSync } = require("node:child_process")
 const { Metrics, Fleet, Probe, readingOf, renderProbe } = require("./harness.js")
+const { runPanelDetail } = require("./qml.js")
 
 test("a detected node is cached even when no sample could be parsed", () => {
   // Caching only on a successful sample meant a node that answered but yielded
@@ -282,17 +283,24 @@ test("a missing curl blames the machine, not every server", () => {
       { encoding: "utf8", env: { PATH: bin }, timeout: 30000 }).stdout || ""
     assert.equal(Probe.failure(out), "notool", `expected NOTOOL, got ${JSON.stringify(out)}`)
 
+    // The row is UN-PROBED, not failed: nothing here could ask it anything.
+    // It must not read "unreachable" -- the word a powered-off box gets -- and
+    // it does not get a state of its own either, because a missing curl is one
+    // fact about this computer rather than one fact about each server.
     const node = readingOf(out, {}).node
     assert.equal(node.probeTool, false)
-    assert.equal(Fleet.stateLabel(node), "no probe tool",
+    assert.equal(node.read, false, "a server nothing asked was marked as read")
+    assert.equal(Fleet.stateLabel(node), "measuring",
       "a machine with no curl blamed the server instead")
-    assert.equal(Fleet.stateTone(node), "down")
 
-    // And the panel says it once, as a fact about this computer.
+    // The panel says the real cause, once, in the headline and the line below.
     const fleet = Fleet.fleetState([node, node])
     assert.equal(fleet.noTool, 2)
-    assert.equal(Fleet.headline(fleet, true, true), "curl is not installed",
-      "the headline blamed the servers for a missing package")
+    assert.equal(fleet.down, 0, "servers nobody asked were counted as down")
+    assert.equal(Fleet.headline(fleet, true, Fleet.baselineReady([node, node])),
+      "curl is not installed", "the headline blamed the servers for a missing package")
+    assert.equal(runPanelDetail({ nodes: [node, node] }),
+      "Every server is probed with curl — install it to use this widget")
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }

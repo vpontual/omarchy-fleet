@@ -115,7 +115,6 @@ Every state exists to keep the widget from saying something it has not measured.
 | `no activity signal` | it answered, but published nothing that counts work |
 | `not responding` | it accepted the connection and then said nothing — wedged, not off |
 | `unreachable` | it was asked and did not answer at all |
-| `no probe tool` | `curl` is not installed here, so nothing could be asked |
 
 `measuring` and `no activity signal` are the two that matter: neither is `idle`,
 because an absence of evidence is not evidence of quiet. A server restart resets
@@ -188,8 +187,9 @@ installed, and no service is started or stopped.**
 Per configured server, per refresh, it runs `curl` against that server inside a
 small `bash` wrapper, reads the response and displays numbers from it. That is
 the whole of it. `curl` is the only thing it needs that Omarchy does not
-guarantee; if it is missing the widget says so rather than reporting your fleet
-as down.
+guarantee. If it is missing, the panel says so — the rows read `measuring`,
+because nothing here could ask them anything, rather than reporting your whole
+fleet as down.
 
 Once a server has been identified that is **one** request — `/metrics` for the
 metrics-bearing runtimes, `/api/ps` for Ollama — and a second only when the

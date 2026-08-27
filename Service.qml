@@ -11,16 +11,15 @@ import "lib/Text.js" as Text
 
 // Fleet activity for the bar widget.
 //
-// The shape of this file is set by two constraints.
+// Two constraints set the shape of this file.
 //
-// One: a vLLM /metrics body is ~68 kB, and this runs inside the process that
-// hosts the whole desktop. So the payload is filtered by `grep` at the fetch
-// boundary and the shell only ever sees a few hundred bytes per node.
+// A vLLM /metrics body is ~68 kB and this runs inside the process that draws
+// the whole desktop, so the payload is filtered by `grep` at the fetch
+// boundary and the shell sees a few hundred bytes per node.
 //
-// Two: activity is a COUNTER DELTA, so every node needs a previous sample to
-// compare against. The first poll after a start can therefore never report
-// activity -- it establishes the baseline. That is why nodes begin as
-// "waiting for a second reading" rather than as idle.
+// Activity is a COUNTER DELTA, so every node needs a previous sample to
+// compare against. The first poll can never report activity -- it establishes
+// the baseline -- which is why nodes begin as "measuring", not as idle.
 Item {
   id: root
 
@@ -36,11 +35,8 @@ Item {
   readonly property var fleet: Fleet.fleetState(nodes)
   readonly property bool busy: fleet.busy
   // True only once every node has produced two readings, so the UI can say
-  // "measuring" instead of asserting an idle fleet it has not yet observed.
-  //
-  // Derived rather than assigned: it is a pure function of the rows, and as an
-  // imperative flag the only place it could be recomputed was the publish
-  // path -- so it was one more thing that had to be remembered there.
+  // "measuring" rather than assert an idle fleet it has not observed. Derived,
+  // not assigned: as a flag it could only be recomputed in the publish path.
   readonly property bool baselineReady: Fleet.baselineReady(nodes)
 
   readonly property int refreshIntervalSec: intSetting("refreshIntervalSec", 3, 1, 60)
@@ -70,7 +66,8 @@ Item {
 
   // Comma or whitespace separated, so "a, b" and "a b" both work. Anything
   // that is not a plain host[:port] is dropped rather than passed to a shell.
-  // Parsed ONCE per settings change, not once per node per cycle.
+  //
+  // Parsed ONCE per settings change, not once per node per poll.
   //
   // This used to re-parse and re-regex the whole `servers` string on every
   // call, and it is called from a binding (`Instantiator.model`) and from
@@ -142,11 +139,9 @@ Item {
 
   // Forget what was detected, so the next poll re-discovers from scratch.
   //
-  // A misdetection was otherwise permanent for the life of the shell: start
-  // llama-server WITHOUT --metrics and it is found on /v1/models as `openai`,
-  // cached, and reads "no activity signal" forever -- restarting llama.cpp
-  // with --metrics does not help, only restarting omarchy-shell does. The
-  // manual refresh is the natural place to offer that.
+  // Without this a misdetection is permanent for the life of the shell: start
+  // llama-server WITHOUT --metrics and it is found on /v1/models as `openai`
+  // and cached, and restarting it WITH --metrics does not help.
   function rediscover() {
     _state = ({})
     _rows = ({})
@@ -156,16 +151,12 @@ Item {
 
   // Poll every configured host that is not already being polled.
   //
-  // PER HOST, not per fleet, and that is the whole shape of this file. It used
-  // to run fleet-wide cycles: one counter of outstanding probes, nothing
-  // published until it reached zero, and an early return while any of it was
-  // in flight. So the slowest host set the period for every other host, and
-  // the user's refresh interval was silently unachievable -- measured at
-  // 16 seconds against a configured 3 because ONE address in the fleet was
-  // unreachable, and a full discovery sweep makes that 33. Activity here is a
-  // counter delta, so that interval is not just display lag: it is the window
-  // the delta is taken over, and this widget exists to answer "is it working
-  // RIGHT NOW".
+  // PER HOST, not per fleet, and that is the whole shape of this file. Run as
+  // fleet-wide cycles -- nothing published until every probe returned -- the
+  // slowest host sets the period for all of them and the configured interval
+  // becomes unachievable: 16 seconds against a configured 3, from one
+  // unreachable address. Activity is a counter delta, so that interval is also
+  // the window the delta covers, and this widget answers "right NOW".
   //
   // A host already in flight is skipped rather than stacked, which is what the
   // fleet-wide fence was really for.
@@ -222,13 +213,10 @@ Item {
     var budget = Probe.budgetSec(host, known)
     proc.host = host
     proc.deadlineMs = Date.now() + (budget + 2) * 1000
-    // `timeout` wraps BASH, not curl: GNU timeout runs its command in its own
-    // process group and signals that group, so the bound covers the whole
-    // sweep rather than one request inside it. `env -u` because
-    // non-interactive `bash -c` sources $BASH_ENV before running its script --
-    // not a privilege boundary, since anything that can set it already runs as
-    // this user, but this wrapper should not be a way into a shell it did not
-    // intend to start.
+    // `timeout` wraps BASH, not curl: it signals the whole process group, so
+    // the bound covers the entire sweep rather than one request inside it.
+    // `env -u` because non-interactive `bash -c` sources $BASH_ENV first --
+    // not a privilege boundary, but not a door this wrapper should open.
     proc.command = ["/usr/bin/env", "-u", "BASH_ENV", "-u", "ENV",
                     "/usr/bin/timeout", "--signal=KILL", String(budget),
                     "/usr/bin/bash", "-c", Probe.script(host, known)]
@@ -245,11 +233,9 @@ Item {
 
   // ── Result assembly ─────────────────────────────────────────────────
 
-  // We learned nothing about this server: our own probe failed, or there was
-  // no slot to run it in. Reset the row to the un-probed one rather than
-  // recording a failed reading -- "unreachable" is a claim about the SERVER,
-  // and both of these are facts about us. The row reads "measuring", which is
-  // true, and the next poll clears it.
+  // We learned nothing: our own probe failed, or there was no slot to run it
+  // in. Reset the row to the un-probed one rather than record a failed reading
+  // -- "unreachable" is a claim about the SERVER, and these are facts about us.
   function _forget(host) {
     _rows[host] = Fleet.blankNode(host, labelFor(host), _state[host])
     probing = _anyRunning()
@@ -274,11 +260,10 @@ Item {
   // Assemble the table from whatever each host has last said.
   function _publish() {
     var out = Poll.tableRows(configuredServers(), _rows, _state)
-    // Assigning a fresh array re-runs every binding downstream, and a JS
-    // array model has no diffing -- so every NodeRow (a CursorSurface and
-    // five Texts) is destroyed and rebuilt, twenty times a minute, in the
-    // process that draws the whole desktop. A quiet fleet produces the same
-    // rows over and over, so most polls have nothing to publish.
+    // A JS array model has no diffing, so assigning a fresh one destroys and
+    // rebuilds every NodeRow -- a CursorSurface and five Texts each -- twenty
+    // times a minute in the process that draws the desktop. A quiet fleet
+    // produces identical rows, so most polls have nothing to publish.
     var next = Fleet.signature(out)
     if (next === _signature) return
     _signature = next
@@ -288,10 +273,8 @@ Item {
   // A pool of Process objects, one per configured server, addressed by index.
   //
   // Instantiator, NOT Repeater: a Repeater can only create Items and a Process
-  // is a plain QtObject, so it silently produced nothing -- itemAt() returned
-  // null for every host and the whole fleet reported unreachable. The shell
-  // logged "Delegate must be of Item type"; nothing surfaced in the widget.
-  // The shell itself uses Instantiator for the same reason.
+  // is a plain QtObject, so a Repeater silently produces nothing -- itemAt()
+  // returns null for every host and the whole fleet reads unreachable.
   Instantiator {
     id: probePool
     model: root.configuredHosts().length

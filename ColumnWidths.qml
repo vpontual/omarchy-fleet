@@ -6,14 +6,12 @@ import "lib/Fleet.js" as Fleet
 //
 // Every row is handed identical widths so the columns line up; a row that
 // measured for itself would drift the moment two nicknames differed in length.
-// This lived in Panel.qml, whose job is drawing -- 88 lines of measurement in a
-// file that also drew the panel, composed the headline copy and rendered rows.
+// TextMetrics uses the same font the rows draw with, so this holds for a
+// proportional font too.
 //
-// TextMetrics measures with the same font the rows draw with, so this holds for
-// a proportional font too, not only the monospace default. The metrics object is
-// declared as a PROPERTY rather than a child because QtObject has no default
-// property and silently refuses to hold one -- "Cannot assign to non-existent
-// default property", which surfaces only when a real shell loads the file.
+// The metrics object is a PROPERTY rather than a child: QtObject has no default
+// property and silently refuses to hold one, which surfaces only when a real
+// shell loads the file.
 QtObject {
   id: widths
 
@@ -36,12 +34,9 @@ QtObject {
   // The width a row actually occupies, computed from the column widths rather
   // than read off the Row.
   //
-  // Row.implicitWidth sums its children's implicitWidth -- their NATURAL text
-  // widths -- not the widths assigned to them. With every server idle that
-  // summed the word "idle" rather than the state column, so the panel sized
-  // itself to a narrow row and then clipped "working  257 tok" the moment a
-  // server started working: the visible symptom was the word it grew for being
-  // the one word cut off.
+  // Row.implicitWidth sums its children's NATURAL text widths, not the widths
+  // assigned to them -- so with every server idle it sums the word "idle", and
+  // the panel then clips "working  257 tok" the moment one starts working.
   readonly property real rowContentWidth: {
     var cols = [label, host, runtime, state]
     var total = 0, shown = 0
@@ -55,17 +50,13 @@ QtObject {
 
   // The widest of them, BY MEASUREMENT.
   //
-  // This used to pick the longest string by character count and measure only
-  // that one. Characters are not width in a proportional font: "no activity
-  // signal" is 18 characters of mostly i/l/t and lays out narrower than the
-  // 17-character "working  9999 tok", so the column was sized to the wrong
-  // value and clipped the other -- the same class of defect as sizing to the
-  // current values instead of the reachable ones, below.
+  // Characters are not width in a proportional font: "no activity signal" is
+  // 18 characters of mostly i/l/t and lays out NARROWER than the 17-character
+  // "working  9999 tok". So every candidate is measured, not the longest one.
   //
   // advanceWidth, ceiled, plus a pixel: TextMetrics.width is the ink extent and
-  // comes out fractionally narrower than the width Text lays itself out to, so
-  // using it directly elides every value by one character -- which looked like
-  // the columns were too narrow rather than off by a rounding step.
+  // is fractionally narrower than the width Text lays itself out to, so using
+  // it directly elides every value by one character.
   function _widest(values, bold) {
     metrics.font.bold = bold === true
     var best = 0
@@ -83,10 +74,8 @@ QtObject {
     widths.host = _widest(Fleet.columnValues(widths.nodes, "host"))
     widths.runtime = _widest(Fleet.columnValues(widths.nodes, "runtime"))
     // Sized for the widest state this column can REACH, not the widest it
-    // happens to be showing. Sizing to the current values made the panel jump
-    // wider the moment a server started working -- and clip the word it grew
-    // for, when the new width hit the cap. A representative worst case keeps
-    // the width stable and always fitting.
+    // happens to be showing -- otherwise the panel jumps wider the moment a
+    // server starts working, and clips the word it grew for.
     widths.state = _widest(
       Fleet.columnValues(widths.nodes, "state").concat(["working  9999 tok"]), true)
   }

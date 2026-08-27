@@ -125,19 +125,15 @@ Panel {
     bar: root.bar
     open: root.opened
     focusTarget: keyCatcher
-    // fittedContentWidth(desired, cap) -- the first argument is what the content
-    // WANTS, not a fixed size. Passing a flat 400 made the panel 400 wide
-    // whatever was in it, which is where the dead space to the right of the
-    // status came from. The floor keeps the header from collapsing when there
-    // are no servers configured yet.
-    // Driven by the measured columns, NOT by column.implicitWidth.
+    // fittedContentWidth(desired, cap): the first argument is what the content
+    // WANTS, not a fixed size -- a flat number makes the panel that wide
+    // whatever is in it. The floor keeps the header from collapsing when no
+    // servers are configured yet.
     //
-    // A Column whose children all bind `width: parent.width` reports an
-    // implicitWidth of 0 -- Qt breaks the circular dependency that way -- so
-    // sizing the panel from it silently pinned the width to the floor below,
-    // and the state column then clipped the word it had grown for. Measured:
-    // colImplicit=0 while the row genuinely needed far more. rowContentWidth
-    // comes from TextMetrics instead, which depends on no layout at all.
+    // Driven by the MEASURED columns, not by column.implicitWidth: a Column
+    // whose children all bind `width: parent.width` reports an implicitWidth of
+    // 0, because that is how Qt breaks the circular dependency. Sizing from it
+    // pins the panel to the floor below and the state column clips.
     contentWidth: panel.fittedContentWidth(
                     Math.max(Style.space(300),
                              widths.rowContentWidth + Style.spacing.lg * 2 + Style.space(24)),

@@ -8,11 +8,8 @@ import "lib/Text.js" as Text
 // One server's row: nickname, address, runtime, state, and a quieter line
 // saying what it is running.
 //
-// It lived inside Panel.qml as an inline component, reaching up into its
-// parent by id for four column widths and five theme colours. Those are
-// properties now, which is what let it move -- and it is why the file is
-// worth having on its own: Panel.qml was drawing the panel, composing the
-// headline copy, measuring columns AND rendering rows.
+// Everything it needs is a property rather than a reach up into a parent by
+// id, which is what lets it be a file of its own.
 CursorSurface {
   id: nodeRow
 
@@ -24,11 +21,10 @@ CursorSurface {
   property real stateWidth: 0
   property real rowContentWidth: 0
 
-  // Theme, from the bar rather than re-derived here.
-  // foreground comes from CursorSurface. It is NOT redeclared here: the split
-  // stripped a `root.` prefix off `foreground: root.foreground` and left the
-  // property bound to itself, which survived only because Panel.qml overrides
-  // it at the instantiation site. On its own that is a binding loop.
+  // Theme, from the bar rather than re-derived here. `foreground` comes from
+  // CursorSurface and must NOT be redeclared: `foreground: root.foreground`
+  // without the prefix binds the property to itself, which is a binding loop
+  // masked by Panel.qml overriding it at the instantiation site.
   property color dim: Color.muted
   property color urgent: Color.urgent
   property color hoverFill: "transparent"
@@ -45,19 +41,12 @@ CursorSurface {
   readonly property string stateText: Fleet.stateLabel(node)
   // A traffic light, because the state is the thing you glance at.
   //
-  // Green and amber are fixed rather than theme-derived: the shell's
-  // foundational palette is foreground/background/accent/urgent/muted, with
-  // no semantic green, and status colour is conventional in a way accent is
-  // not -- accent is blue in some themes and would read as "information".
-  // Red stays urgent, which IS the theme's own alert colour, so the one
-  // state that means "something is wrong" matches the rest of the bar.
-  // The ladder itself is in lib/Fleet.js and executed by tests: as a chain of
-  // ternaries here, four separate mutations of it -- drawing an unreachable
-  // node GREEN among them -- left the whole suite passing.
+  // Green and amber are fixed rather than theme-derived: the shell's palette
+  // has no semantic green, and accent is blue in some themes and would read as
+  // "information". Red stays `urgent`, the theme's own alert colour, so the one
+  // state meaning "something is wrong" matches the rest of the bar.
   //
-  // "measuring" is dim, not amber. Amber for both made "I am generating" and
-  // "I cannot tell yet" the same colour at a glance, which is the one
-  // distinction this widget exists to draw.
+  // The ladder itself is in lib/Fleet.js, where a test can execute it.
   readonly property color stateColor: {
     var tone = Fleet.stateTone(node)
     if (tone === "down") return urgent
@@ -98,11 +87,10 @@ CursorSurface {
   implicitWidth: rowContentWidth + Style.spacing.lg * 2
   fill: hoverFill
 
-  // Nickname, address and runtime as three real columns. The nickname is
-  // kept BESIDE the address rather than replacing it: a name you chose
-  // identifies the box, but the address is what you need when it stops
-  // answering. With no nickname configured the column collapses to zero
-  // width and the address simply starts at the left.
+  // Nickname, address and runtime as three real columns. The nickname sits
+  // BESIDE the address rather than replacing it: a name you chose identifies
+  // the box, but the address is what you need when it stops answering. With no
+  // nickname the column collapses to zero width.
   Row {
     id: nameText
     anchors.left: parent.left

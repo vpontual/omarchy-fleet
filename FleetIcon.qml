@@ -3,15 +3,14 @@ import qs.Commons
 
 // A stack of servers that lights when the fleet is doing work.
 //
-// It was a processor die before, and it read as "some chip" -- at bar size the
-// pins that were meant to say "processor" are three pixels each and just make
-// the silhouette noisy. Three stacked units is the conventional glyph for
-// servers, and this widget is about a FLEET, not about silicon.
+// Three stacked units, the conventional glyph for servers: this widget is
+// about a FLEET, not about silicon, and a processor die at bar size is just a
+// noisy silhouette.
 //
 // Lit and dark differ in MASS -- solid fill against a hollow outline -- because
 // at ~22px that is what reads in peripheral vision. A brightness or opacity
-// difference on the same silhouette is not legible at a glance, which is the
-// whole job of an activity light.
+// difference on the same shape is not legible at a glance, which is the whole
+// job of an activity light.
 Item {
   id: root
 
@@ -22,12 +21,10 @@ Item {
   property bool active: false
   // Nothing to report on: no servers configured, or none reachable.
   property bool warning: false
-  // Reachable, but an unlit icon would be a claim the widget cannot support:
-  // nothing has been measured yet, or nothing in the fleet is ABLE to report
-  // activity. Without this, such a fleet drew the identical hollow icon as one
-  // measured and genuinely quiet -- and hollow is documented, three lines up,
-  // as work having stopped. Quieter than `warning`, which is an alert; this is
-  // a footnote, and the two share one badge so the silhouette stays legible.
+  // Reachable, but an unlit icon would be a claim we cannot support: nothing
+  // measured yet, or nothing in the fleet ABLE to report activity. Hollow is
+  // documented three lines up as work having stopped. Quieter than `warning`,
+  // which is an alert -- they share one badge so the silhouette stays legible.
   property bool unknown: false
   property color unknownColor: Color.muted
 
