@@ -36,7 +36,13 @@ Panel {
   readonly property color hoverFill: bar ? Style.hoverFillFor(bar.foreground, Color.accent, bar.urgent) : "transparent"
 
   readonly property bool configured: fleet.configuredHosts().length > 0
-  readonly property bool nothingReachable: configured && fleet.fleet.up === 0
+  // Both live in Model.js, executed by tests. This one was `up === 0`, which
+  // is also true of a fleet nobody has asked yet -- so the panel announced
+  // "No servers reachable" over servers still being probed, one of which was
+  // answering in milliseconds.
+  readonly property bool nothingReachable: Model.nothingReachable(fleet.fleet, configured)
+  readonly property bool activityUnknown:
+    Model.activityUnknown(fleet.fleet, configured, fleet.baselineReady)
 
   // Deliberately says "Measuring" until every node has produced two readings:
   // activity is a counter delta, so before that the widget has not observed an
@@ -95,8 +101,10 @@ Panel {
           iconSize: Style.space(11)
           color: fleet.busy ? root.barForeground : Qt.darker(root.barForeground, 1.55)
           badgeColor: root.urgent
+          unknownColor: Qt.darker(root.barForeground, 1.55)
           active: fleet.busy
           warning: !root.configured || root.nothingReachable
+          unknown: root.activityUnknown
         }
       }
     }
@@ -167,8 +175,10 @@ Panel {
                 iconSize: Style.font.display
                 color: fleet.busy ? root.foreground : root.dim
                 badgeColor: root.urgent
+                unknownColor: root.dim
                 active: fleet.busy
                 warning: !root.configured || root.nothingReachable
+                unknown: root.activityUnknown
               }
             }
             trailingControl: Component {

@@ -91,7 +91,10 @@ function script(Model, host, known) {
     // already true, and every later cycle returns early on it. Forever. An
     // empty script instead yields an empty reply and an honest "unreachable".
     if (!rt) return ""
-    var url = "http://" + addr.host + ":" + known.port + rt.probe
+    // QUOTED, like the discovery sweep below. isSafeHost and the port clamp
+    // both hold, so this is safe today -- but that is an argument about two
+    // other functions, and this is the string that reaches a shell.
+    var url = "\"http://" + addr.host + ":" + known.port + rt.probe + "\""
     // 2>/dev/null like every other curl here: -sS keeps error text for a human
     // and $(...) captures stdout only, so without this it escapes to the
     // shell's stderr, which nothing collects and nobody reads.

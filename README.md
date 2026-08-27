@@ -21,13 +21,17 @@ looking exactly like a busy one. `nvidia-smi` in a spare terminal tells you abou
 one machine, and only while you are looking at it.
 
 This puts the answer in the bar. The icon fills in when work is happening and
-empties when it stops. Open the panel and each server says what it is doing, with
-a live token count for the ones that publish one.
+empties when it stops — and carries a small dot when it cannot honestly say
+either, because nothing has been measured yet or nothing in the fleet is able to
+report activity. An empty icon is a claim that work stopped, so it is only drawn
+when that has actually been observed.
 
-Each row also says **what** the node is running, and whether it is struggling:
-the loaded model, KV cache pressure once it means something, and how many
-requests are queued behind the one being served. Those come from the same
-response the activity signal does — no extra request, no agent to install.
+Open the panel and each server says what it is doing, with a live token count for
+the ones that publish one. Each row also says **what** the node is running, and
+whether it is struggling: the loaded model, how many requests are in flight and
+queued behind them, and KV cache pressure once it means something. Those come
+from the same response the activity signal does — no extra request, no agent to
+install.
 
 It is deliberately **not** a dashboard, a controller, or a cost tracker. It does
 not start services, load models, change clocks, or bill anything, and it does
@@ -79,6 +83,28 @@ coarser signal than a token count and the panel does not pretend otherwise.
 **"llama.cpp shows nothing"** almost always means `llama-server` was started
 without `--metrics`. It serves no metrics endpoint unless asked to.
 
+**A node serving several models at once reports one of them.** The model name is
+read from the labels on the series it already fetches, and the first is shown.
+The token counts are summed across every engine and model, so the *activity* is
+right; the name beside it is not the whole story.
+
+### What a row will not claim
+
+Every state exists to keep the widget from saying something it has not measured.
+
+| the row says | it means |
+|---|---|
+| `idle` | it asked, twice, and the work counter did not move |
+| `working  N tok` | the counter moved by N between two readings |
+| `measuring` | no comparable pair yet — first reading, a restarted counter, or a host not probed since you added it |
+| `no activity signal` | it answered, but published nothing that counts work |
+| `unreachable` | it was asked and did not answer |
+
+`measuring` and `no activity signal` are the two that matter: neither is `idle`,
+because an absence of evidence is not evidence of quiet. A server restart resets
+the token counter, and reading that negative delta as "no work" once drew a bold
+green `idle` over a node that was serving four requests.
+
 ## Install
 
 ```sh
@@ -99,6 +125,9 @@ A bare host is swept for the ports these runtimes normally use
 (`8000`, `11434`, `8080`, `30000`, `1234`) and the runtime is identified from
 what answers. Giving an explicit `host:port` skips the sweep.
 
+Addresses are IPv4 or hostnames. A bracketed IPv6 literal is rejected as
+unusable, and the panel says so rather than dropping it quietly.
+
 Name a server with `=` when its address is not memorable:
 
 ```sh
@@ -112,6 +141,11 @@ identifies the machine, but the address is what you need when it stops answering
 |---|---|---|
 | `servers` | *(empty)* | `host`, `host:port`, or `host=Nickname` |
 | `refreshIntervalSec` | `3` | 1–60 |
+
+Each server is polled on its own schedule, so one slow or unreachable address
+does not hold up the rest: a host still working through a discovery sweep is
+skipped while its neighbours keep reporting at the interval you set. Rows appear
+as soon as you configure them and read `measuring` until that server answers.
 
 ## What it runs on your machine
 
@@ -189,7 +223,7 @@ curl -sSf http://YOUR_SERVER:8000/metrics | head
 ## Development
 
 ```sh
-npm test                      # 97 tests, no dependencies
+npm test                      # 103 tests, no dependencies
 omarchy plugin validate .
 ```
 
@@ -201,15 +235,20 @@ running shell:
 | `Model.js` | runtime adapters, Prometheus parsing, sampling, activity maths |
 | `Probe.js` | builds the probe command, reads what it prints back |
 | `Reading.js` | one probe result to one node record: what a row may claim |
-| `Service.qml` | process pool, timers, cycle bookkeeping, IPC |
+| `Service.qml` | the process pool, the poll timer, IPC |
 | `Panel.qml` | the panel and its headline copy |
 | `NodeRow.qml` | one server's row |
 | `ColumnWidths.qml` | measures each column once for the whole table |
 | `FleetIcon.qml` | the bar glyph |
 
 That split is not tidiness. Logic living in QML can only be reached by tests
-through a source extractor, and both of the worst defects found in review were
-in exactly that region — one a function that was called and never defined.
+through a source extractor, and an assertion that reads source can pass against
+a comment. Every serious defect found in review has been in that region: a
+function that was called and never defined; a colour ladder where four
+mutations, one of them drawing an unreachable server green, left the whole suite
+passing. Anything that decides what the widget may claim now lives in plain
+JavaScript and is executed by a test, including the polling decisions
+themselves.
 
 Note that neither `npm test` nor `omarchy plugin validate` loads the QML, so a
 fatal QML error passes both. Check a real shell before believing a change works.

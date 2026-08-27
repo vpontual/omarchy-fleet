@@ -1,6 +1,5 @@
 import QtQuick
 import qs.Commons
-import qs.Ui
 import "Model.js" as Model
 
 // How wide each column has to be, measured once for the whole table.
@@ -54,27 +53,6 @@ QtObject {
     return total + Style.spacing.lg * Math.max(0, shown - 1)
   }
 
-  // Every value a column will have to hold.
-  //
-  // An unknown column name returns nothing rather than falling through to the
-  // runtime label: a typo used to measure the wrong field silently.
-  function _values(field) {
-    var rows = widths.nodes || []
-    var out = []
-    for (var i = 0; i < rows.length; i++) {
-      if (field === "label") out.push(String(rows[i].label || rows[i].host || ""))
-      else if (field === "host") out.push(String(rows[i].host || ""))
-      else if (field === "state") out.push(Model.stateLabel(rows[i]))
-      else if (field === "runtime") {
-        var rt = rows[i].runtime ? Model.runtimeOf(rows[i].runtime) : null
-        out.push(rt ? rt.label : String(rows[i].runtime || ""))
-      } else {
-        return []
-      }
-    }
-    return out
-  }
-
   // The widest of them, BY MEASUREMENT.
   //
   // This used to pick the longest string by character count and measure only
@@ -101,15 +79,16 @@ QtObject {
   }
 
   function _measure() {
-    widths.label = _widest(_values("label"))
-    widths.host = _widest(_values("host"))
-    widths.runtime = _widest(_values("runtime"))
+    widths.label = _widest(Model.columnValues(widths.nodes, "label"))
+    widths.host = _widest(Model.columnValues(widths.nodes, "host"))
+    widths.runtime = _widest(Model.columnValues(widths.nodes, "runtime"))
     // Sized for the widest state this column can REACH, not the widest it
     // happens to be showing. Sizing to the current values made the panel jump
     // wider the moment a server started working -- and clip the word it grew
     // for, when the new width hit the cap. A representative worst case keeps
     // the width stable and always fitting.
-    widths.state = _widest(_values("state").concat(["working  9999 tok"]), true)
+    widths.state = _widest(
+      Model.columnValues(widths.nodes, "state").concat(["working  9999 tok"]), true)
   }
 
   property TextMetrics metrics: TextMetrics {

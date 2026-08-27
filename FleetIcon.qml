@@ -1,6 +1,5 @@
 import QtQuick
 import qs.Commons
-import qs.Ui
 
 // A stack of servers that lights when the fleet is doing work.
 //
@@ -23,6 +22,14 @@ Item {
   property bool active: false
   // Nothing to report on: no servers configured, or none reachable.
   property bool warning: false
+  // Reachable, but an unlit icon would be a claim the widget cannot support:
+  // nothing has been measured yet, or nothing in the fleet is ABLE to report
+  // activity. Without this, such a fleet drew the identical hollow icon as one
+  // measured and genuinely quiet -- and hollow is documented, three lines up,
+  // as work having stopped. Quieter than `warning`, which is an alert; this is
+  // a footnote, and the two share one badge so the silhouette stays legible.
+  property bool unknown: false
+  property color unknownColor: Color.muted
 
   width: iconSize
   height: iconSize
@@ -61,13 +68,14 @@ Item {
   }
 
   Rectangle {
-    visible: root.warning
+    visible: root.warning || root.unknown
     readonly property real size: Math.min(root.span * 0.5, root.iconSize * 0.28)
     width: size; height: size
     radius: size / 2
     x: root.iconSize - size
     y: root.iconSize - size
-    color: root.badgeColor
+    // An alert outranks a footnote.
+    color: root.warning ? root.badgeColor : root.unknownColor
     border.color: Color.popups.background
     border.width: root.active ? 1 : 0
   }

@@ -8,6 +8,10 @@
 function apply(Model, Probe, host, label, out, prev, now) {
   prev = prev || {}
   var node = Model.blankNode(host, label, prev)
+  // A probe came back for this host. Says nothing about whether it succeeded --
+  // only that the row below is a report rather than a placeholder, which is
+  // the distinction every "unreachable" claim rests on.
+  node.read = true
   var state = null
 
   var read = Probe.parse(Model, out, Model.MAX_PROBE_BYTES)
@@ -15,9 +19,6 @@ function apply(Model, Probe, host, label, out, prev, now) {
     node.reachable = true
     node.runtime = read.runtime
     node.port = read.port !== null ? read.port : prev.port
-
-    var rt = Model.runtimeOf(read.runtime)
-    node.canReportActivity = !(rt && rt.noActivity)
 
     var sample = Model.readSample(read.runtime, read.body)
 

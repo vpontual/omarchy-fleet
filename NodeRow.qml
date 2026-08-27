@@ -49,11 +49,18 @@ CursorSurface {
   // not -- accent is blue in some themes and would read as "information".
   // Red stays urgent, which IS the theme's own alert colour, so the one
   // state that means "something is wrong" matches the rest of the bar.
+  // The ladder itself is in Model.js and executed by tests: as a chain of
+  // ternaries here, four separate mutations of it -- drawing an unreachable
+  // node GREEN among them -- left the whole suite passing.
+  //
+  // "measuring" is dim, not amber. Amber for both made "I am generating" and
+  // "I cannot tell yet" the same colour at a glance, which is the one
+  // distinction this widget exists to draw.
   readonly property color stateColor: {
-    if (!node || !node.reachable) return urgent          // down
-    if (node.canReportActivity === false) return dim     // cannot tell, ever
-    if (node.firstReading) return nodeRow.amber               // cannot tell yet
-    if (node.activity && node.activity.active) return nodeRow.amber
+    var tone = Model.stateTone(node)
+    if (tone === "down") return urgent
+    if (tone === "unknown") return dim
+    if (tone === "working") return nodeRow.amber
     return nodeRow.green
   }
   readonly property color green: "#7fb069"
@@ -67,12 +74,17 @@ CursorSurface {
     var bits = []
     var model = Model.shortModelName(node.model || "")
     if (model !== "") bits.push(model)
+    // Collected, summed across engines, carried in the row signature -- and
+    // never once rendered, while the README advertised it. A row that changed
+    // only in `running` therefore rebuilt itself for a number nothing drew.
+    if (typeof node.running === "number" && node.running > 0)
+      bits.push(node.running + " running")
+    if (typeof node.waiting === "number" && node.waiting > 0)
+      bits.push(node.waiting + " queued")
     // A fraction on the wire; a percentage is what a person reads. Shown only
     // once it means something -- an idle engine sitting at 0% is noise.
     if (typeof node.cache === "number" && node.cache > 0.01)
       bits.push(Math.round(node.cache * 100) + "% cache")
-    if (typeof node.waiting === "number" && node.waiting > 0)
-      bits.push(node.waiting + " queued")
     return bits.join("   ")
   }
 

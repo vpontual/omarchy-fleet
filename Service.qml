@@ -2,7 +2,6 @@ import QtQuick
 import QtQml
 import Quickshell
 import Quickshell.Io
-import qs.Commons
 import "Model.js" as Model
 import "Probe.js" as Probe
 import "Reading.js" as Reading
@@ -26,7 +25,8 @@ Item {
   property QtObject bar: null
 
   // ── Observed state ──────────────────────────────────────────────────
-  // One entry per configured server. Rebuilt wholesale on each cycle.
+  // One row per configured server, in address order. Republished only when
+  // something a row renders has changed.
   property var nodes: []
   property bool probing: false
 
@@ -34,19 +34,22 @@ Item {
   readonly property bool busy: fleet.busy
   // True only once every node has produced two readings, so the UI can say
   // "measuring" instead of asserting an idle fleet it has not yet observed.
-  property bool baselineReady: false
+  //
+  // Derived rather than assigned: it is a pure function of the rows, and as an
+  // imperative flag the only place it could be recomputed was the publish
+  // path -- so it was one more thing that had to be remembered there.
+  readonly property bool baselineReady: Model.baselineReady(nodes)
 
   readonly property int refreshIntervalSec: intSetting("refreshIntervalSec", 3, 1, 60)
   readonly property string serversSetting: stringSetting("servers", "")
 
   // host -> { host, port, runtime, sample, lastSeenMs }
   property var _state: ({})
-  property int _pending: 0
-  // Incremented per refresh; a result carrying an older id is discarded.
-  property int _cycle: 0
+  // host -> the last row built for it. The table is assembled from this, so
+  // one host's slow probe cannot hold up another host's result.
+  property var _rows: ({})
   // What was last published, so an unchanged fleet is not republished.
   property string _signature: ""
-  property var _collected: []
 
   function setting(name, fallback) {
     var v = settings ? settings[name] : undefined
@@ -142,73 +145,77 @@ Item {
   // with --metrics does not help, only restarting omarchy-shell does. The
   // manual refresh is the natural place to offer that.
   function rediscover() {
-    _state = {}
+    _state = ({})
+    _rows = ({})
+    _signature = ""
     refresh()
   }
 
+  // Poll every configured host that is not already being polled.
+  //
+  // PER HOST, not per fleet, and that is the whole shape of this file. It used
+  // to run fleet-wide cycles: one counter of outstanding probes, nothing
+  // published until it reached zero, and an early return while any of it was
+  // in flight. So the slowest host set the period for every other host, and
+  // the user's refresh interval was silently unachievable -- measured at
+  // 16 seconds against a configured 3 because ONE address in the fleet was
+  // unreachable, and a full discovery sweep makes that 33. Activity here is a
+  // counter delta, so that interval is not just display lag: it is the window
+  // the delta is taken over, and this widget exists to answer "is it working
+  // RIGHT NOW".
+  //
+  // A host already in flight is skipped rather than stacked, which is what the
+  // fleet-wide fence was really for.
   function refresh() {
-    if (probing) return
     var servers = configuredServers()
     // Nothing configured: publish an empty fleet ONCE rather than reassigning
     // an empty array every tick, which re-evaluated every binding downstream
     // for no reason.
     if (servers.length === 0) {
-      if (nodes.length > 0) nodes = []
+      _state = ({})
+      _rows = ({})
+      if (nodes.length > 0) { nodes = []; _signature = "" }
       return
     }
 
-    // Every cycle carries an id, and _finish drops anything that does not
-    // belong to the current one. The watchdog resets `probing` without killing
-    // the processes, so a straggler from an abandoned cycle used to decrement
-    // the NEW cycle's _pending -- publishing a partial list early, then driving
-    // _pending negative and re-publishing on each further straggler. Servers
-    // flickered in and out of the panel with nothing to say why.
-    _cycle++
-    probing = true
-    // Longer than the slowest probe this cycle can legitimately take, or it
-    // would abandon a sweep that was still within its own deadline.
-    var budget = 0
-    for (var b = 0; b < servers.length; b++) {
-      budget = Math.max(budget, Probe.budgetSec(Model, servers[b].host, _state[servers[b].host]))
-    }
-    probeWatchdog.interval = (budget + 2) * 1000
-    probeWatchdog.restart()
-    _collected = []
-    _pending = servers.length
-    // Drop what we remember about servers no longer configured. Bounded by the
-    // config, so never large -- but a host removed from the settings kept its
-    // cached port, runtime and last sample indefinitely, and got them back if
-    // it was ever re-added, sample included.
-    var live = {}
-    for (var k = 0; k < servers.length; k++) live[servers[k].host] = true
-    for (var host in _state) { if (!live[host]) delete _state[host] }
-    for (var i = 0; i < servers.length; i++) probeHost(servers[i].host, i, _cycle)
+    var hosts = configuredHosts()
+    _state = Model.pruneToConfigured(_state, hosts)
+    _rows = Model.pruneToConfigured(_rows, hosts)
+
+    for (var i = 0; i < servers.length; i++) _poll(servers[i].host, i)
+    probing = _anyRunning()
+    _publish()
   }
 
-  // One process per host. Quickshell's Process is a single-shot object, so a
-  // pool is created declaratively by the Instantiator below, addressed by index.
-  function probeHost(host, index, cycle) {
-    var known = _state[host]
+  // One process per host, addressed by the host's index in the configured
+  // list. Quickshell's Process is single-shot, so the pool is created
+  // declaratively by the Instantiator below.
+  function _poll(host, index) {
     var proc = probePool.objectAt(index)
-    // Fenced like every other result: without the id it would decrement
-    // whatever cycle happens to be current when it lands.
-    if (!proc) { _finish(host, null, cycle); return }
+    // No slot for this host at all: account for it rather than leaving the row
+    // silently un-updated.
+    if (!proc) { _record(host, null); return }
 
-    // A straggler the watchdog abandoned may still be alive on this slot. The
-    // fence stamps the process, not the result, so re-stamping it would credit
-    // its stale output to THIS cycle -- and `running = true` on an already
-    // running Process does nothing, so the host would be silently skipped.
-    // Kill it (its exit lands under the old id and is discarded) and report
-    // the host as unreachable for this cycle rather than inventing a reading.
-    if (proc.running) {
-      _log("killing a straggler on " + proc.host + " from cycle " + proc.cycle)
+    var action = Model.pollAction(proc, Date.now())
+    if (action === "skip") return
+    if (action === "kill") {
+      // `timeout --signal=KILL` inside the command bounds every normal case,
+      // so reaching here means the process itself failed to exit.
+      _log("killing a probe on " + proc.host + " that overran its deadline")
+      proc.abandoned = true
       proc.running = false
-      _finish(host, null, cycle)
+      _record(host, null)
       return
     }
 
+    var known = _state[host]
+    // The deadline comes from the script, not from a constant sitting beside
+    // it: a discovery sweep can spend five times what a known-node read can,
+    // and the two disagreed badly enough that no host was discoverable unless
+    // it answered on the first candidate port.
+    var budget = Probe.budgetSec(Model, host, known)
     proc.host = host
-    proc.cycle = cycle
+    proc.deadlineMs = Date.now() + (budget + 2) * 1000
     // `timeout` wraps BASH, not curl: GNU timeout runs its command in its own
     // process group and signals that group, so the bound covers the whole
     // sweep rather than one request inside it. `env -u` because
@@ -216,64 +223,46 @@ Item {
     // not a privilege boundary, since anything that can set it already runs as
     // this user, but this wrapper should not be a way into a shell it did not
     // intend to start.
-    // The deadline comes from the script, not from a constant sitting beside
-    // it: a discovery sweep can spend five times what a known-node read can,
-    // and the two disagreed badly enough that no host was discoverable unless
-    // it answered on the first candidate port.
     proc.command = ["/usr/bin/env", "-u", "BASH_ENV", "-u", "ENV",
-                    "/usr/bin/timeout", "--signal=KILL",
-                    String(Probe.budgetSec(Model, host, known)),
+                    "/usr/bin/timeout", "--signal=KILL", String(budget),
                     "/usr/bin/bash", "-c", Probe.script(Model, host, known)]
     proc.running = true
   }
 
-  // Built from a fixed template; `host` has already passed isSafeHost, and
-  // nothing else in the string is user-derived.
-  //
-  // When the runtime is not yet known the script sweeps the candidate ports
-  // and prints the first that answers, tagged so the reply identifies both the
-  // port and the body. A refused port answers in about 45ms.
-
+  function _anyRunning() {
+    for (var i = 0; i < probePool.count; i++) {
+      var p = probePool.objectAt(i)
+      if (p && p.running) return true
+    }
+    return false
+  }
 
   // ── Result assembly ─────────────────────────────────────────────────
 
-  function _finish(host, out, cycle) {
-    // A result from a cycle the watchdog gave up on is not evidence about this
-    // one. Its process was never killed, only forgotten.
-    if (cycle !== undefined && cycle !== _cycle) {
-      _log("discarding a late result for " + host + " from cycle " + cycle)
-      return
-    }
+  function _record(host, out) {
     // Everything a reading is allowed to claim is decided in Reading.js,
     // which is plain JS: its branches are executed by tests rather than
     // matched against QML source text.
     var res = Reading.apply(Model, Probe, host, labelFor(host),
                             out, _state[host], Date.now())
     if (res.state) _state[host] = res.state
-    var node = res.node
+    _rows[host] = res.node
+    probing = _anyRunning()
+    _publish()
+  }
 
-    _collected.push(node)
-    _pending--
-    if (_pending <= 0) {
-      _collected.sort(function (a, b) { return a.host < b.host ? -1 : 1 })
-      // Assigning a fresh array re-runs every binding downstream, and a JS
-      // array model has no diffing -- so every NodeRow (a CursorSurface and
-      // five Texts) is destroyed and rebuilt, twenty times a minute, in the
-      // process that draws the whole desktop. A quiet fleet produces the same
-      // rows over and over, so most cycles have nothing to publish.
-      var next = Model.signature(_collected)
-      if (next !== _signature) {
-        _signature = next
-        nodes = _collected
-      }
-      probing = false
-      probeWatchdog.stop()
-      var ready = nodes.length > 0
-      for (var i = 0; i < nodes.length; i++) {
-        if (nodes[i].reachable && nodes[i].firstReading) ready = false
-      }
-      baselineReady = ready
-    }
+  // Assemble the table from whatever each host has last said.
+  function _publish() {
+    var out = Model.tableRows(configuredServers(), _rows, _state)
+    // Assigning a fresh array re-runs every binding downstream, and a JS
+    // array model has no diffing -- so every NodeRow (a CursorSurface and
+    // five Texts) is destroyed and rebuilt, twenty times a minute, in the
+    // process that draws the whole desktop. A quiet fleet produces the same
+    // rows over and over, so most polls have nothing to publish.
+    var next = Model.signature(out)
+    if (next === _signature) return
+    _signature = next
+    nodes = out
   }
 
   // A pool of Process objects, one per configured server, addressed by index.
@@ -289,11 +278,22 @@ Item {
     delegate: Process {
       required property int index
       property string host: ""
-      property int cycle: 0
+      // When this probe may still legitimately be working.
+      property real deadlineMs: 0
+      // Killed for overrunning: whatever it eventually prints is not a
+      // reading, and the slot stays out of service until it actually dies.
+      property bool abandoned: false
       running: false
       command: []
       stdout: StdioCollector { id: collector; waitForEnd: true }
-      onExited: function (exitCode) { root._finish(host, collector.text, cycle) }
+      onExited: function (exitCode) {
+        if (abandoned) {
+          abandoned = false
+          root.probing = root._anyRunning()
+          return
+        }
+        root._record(host, collector.text)
+      }
     }
   }
 
@@ -303,28 +303,5 @@ Item {
     running: true
     triggeredOnStart: true
     onTriggered: root.refresh()
-  }
-
-  // A probe that never returns would stall the cycle forever, since refresh()
-  // returns early while `probing` is true. curl carries --max-time, so this is
-  // the backstop for the process itself failing to exit.
-  Timer {
-    id: probeWatchdog
-    // Replaced per cycle by refresh(); this is only what it starts life with.
-    interval: 35000
-    // Restarted by refresh(), so this is a deadline for THIS cycle rather than
-    // a clock. Free-running, it fired at t=15, 30, 45... regardless of when a
-    // cycle began -- so a cycle starting at 14.9s was abandoned 100ms in, and
-    // the panel could sit stale for up to two intervals while it recovered.
-    repeat: false
-    running: false
-    onTriggered: {
-      if (!root.probing) return
-      root._log("probe cycle overran its " + probeWatchdog.interval + "ms deadline; resetting")
-      // Bump the id so anything still running is fenced out when it lands.
-      root._cycle++
-      root.probing = false
-      root._pending = 0
-    }
   }
 }
