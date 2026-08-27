@@ -484,7 +484,46 @@ test("a cached runtime with no adapter cannot wedge the widget", () => {
   assert.equal(Runtimes.runtimeOf("a-runtime-that-was-removed"), null)
   const script = Probe.script("192.0.2.10", { port: 8000, runtime: "a-runtime-that-was-removed" })
   assert.equal(script, "", "an unknown cached runtime built a probe out of null")
-  // And an empty script is handled rather than run: it yields no markers, so
-  // the reading is "unreachable" for that poll and discovery resumes.
   assert.equal(Probe.parse("", Runtimes.MAX_PROBE_BYTES), null)
+
+  // And discovery must actually RESUME. This comment used to claim it did
+  // while the code did the opposite: the empty script produced empty output,
+  // which took the failure branch, which PRESERVED the unusable runtime -- so
+  // the next poll built the same empty script. The row read "unreachable"
+  // forever and a no-op shell was spawned every interval, for the life of the
+  // shell. Executed here rather than asserted, because the claim was false.
+  const stale = { port: 8000, runtime: "a-runtime-that-was-removed", sample: null, lastSeenMs: 1 }
+  const res = Reading.apply("192.0.2.10", "n", "", stale, 2000)
+  assert.equal(res.state, null, "an unusable cached runtime was preserved again")
+  assert.ok(/if \(res\.state\) _state\[host\] = res\.state/.test(SERVICE))
+  assert.ok(/else delete _state\[host\]/.test(SERVICE),
+    "the service keeps a cache entry the reading asked it to drop")
+
+  // A runtime that IS still known survives a blip, or every hiccup would
+  // trigger a fifteen-request sweep.
+  const good = { port: 8000, runtime: "vllm", sample: null, lastSeenMs: 1 }
+  assert.equal(Reading.apply("192.0.2.10", "n", "", good, 2000).state.runtime, "vllm")
+})
+
+test("a truncated counter does not become tokens that were never generated", () => {
+  // `head -c` cuts mid-line, so a counter can be read as a PREFIX of its real
+  // value -- 48456 arriving as 484. The next untruncated poll then looks like a
+  // huge positive delta and renders as "working  48000 tok" for a server that
+  // did nothing. Only reachable against the hostile body the ceiling exists
+  // for, which is exactly when the widget should be least inventive.
+  const body = "PORT 8000\nRT vllm\nvllm:generation_tokens_total 100\nvllm:generation_tokens_total 48456"
+  const cut = body.slice(0, body.length - 2)          // "...484"
+  const read = Probe.parse(cut, cut.length)
+  assert.ok(read, "a truncated body yielded nothing at all")
+  assert.ok(!/48456|484$/.test(read.body.trim()),
+    `the partial line survived truncation: ${JSON.stringify(read.body)}`)
+  assert.equal(Metrics.sumMetric(read.body, "vllm:generation_tokens_total"), 100,
+    "a half-read counter was summed as though it were whole")
+
+  // A body that fits is untouched, partial-looking last line and all.
+  const whole = Probe.parse(body, Runtimes.MAX_PROBE_BYTES)
+  assert.equal(Metrics.sumMetric(whole.body, "vllm:generation_tokens_total"), 48556)
+
+  // One enormous line with no newline at all yields nothing rather than a fragment.
+  assert.equal(Probe.parse("PORT 8000 RT vllm " + "9".repeat(200), 50), null)
 })

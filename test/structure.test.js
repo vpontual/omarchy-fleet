@@ -10,7 +10,7 @@ const assert = require("node:assert")
 const fs = require("node:fs")
 const path = require("node:path")
 const { Text, Fleet, codeOf, codeLines, sourceOf } = require("./harness.js")
-const { SERVICE, runPanelDetail } = require("./qml.js")
+const { SERVICE, runPanelDetail, runNodeRowColor, runNodeRowDetail } = require("./qml.js")
 
 test("the probe pool is an Instantiator, and callers address it as one", () => {
   // A Repeater can only create Items; Process is a plain QtObject, so the pool
@@ -287,4 +287,130 @@ test("the panel's second line explains what its headline just said", () => {
   assert.equal(runPanelDetail({ nodes: [node({ canReportActivity: false }), node({ canReportActivity: false })] }),
     "2 servers cannot report activity")
   assert.equal(runPanelDetail({ nodes: [node()] }), "")
+})
+
+test("the row's traffic light draws four different things", () => {
+  // The tone ladder in lib/Fleet.js is pinned; the hop from a tone to a COLOUR
+  // is QML, and it was pinned by nothing. Four mutations of it passed the whole
+  // suite -- including returning green for an unreachable server, which is the
+  // defect an earlier round was rejected for, back and undetectable.
+  //
+  // Colours come back as theme-slot names, so this asserts that the states are
+  // distinct without hard-coding a palette.
+  const node = (over) => Object.assign(
+    Fleet.blankNode("192.0.2.10", "n", {}), { read: true, reachable: true }, over || {})
+
+  const down = runNodeRowColor(node({ reachable: false }))
+  const measuring = runNodeRowColor(node({ firstReading: true }))
+  const cannotTell = runNodeRowColor(node({ canReportActivity: false }))
+  const working = runNodeRowColor(node({ activity: { active: true, amount: 5 } }))
+  const idle = runNodeRowColor(node())
+
+  assert.equal(down, "urgent", "an unreachable server is not drawn as an alert")
+  assert.equal(working, "amber")
+  assert.equal(idle, "green")
+  assert.equal(measuring, "dim")
+  assert.equal(cannotTell, "dim")
+
+  // The three claims that must never look alike, stated as a rule rather than
+  // as three colours: quiet, working, and cannot-say.
+  assert.notEqual(idle, working, "generating and quiet are the same colour")
+  assert.notEqual(idle, measuring, "not-yet-measured is drawn as measured quiet")
+  assert.notEqual(idle, down, "an unreachable server is drawn as a quiet one")
+  assert.notEqual(working, measuring, "cannot-tell-yet is drawn as generating")
+
+  // A node nobody has heard from yet must not be drawn green either.
+  assert.notEqual(runNodeRowColor(node({ read: false })), idle)
+})
+
+test("the row's second line says nothing about a server that did not answer", () => {
+  // It reads model, in-flight, queued and cache off the node. Dropping the
+  // reachability guard leaves a dead server still printing its last model and
+  // queue depth underneath the word "unreachable".
+  const node = (over) => Object.assign(
+    Fleet.blankNode("192.0.2.10", "n", {}), { read: true, reachable: true }, over || {})
+
+  assert.equal(runNodeRowDetail(node({ reachable: false, model: "qwen", waiting: 4, cache: 0.9 })), "",
+    "a dead server still reported what it was running")
+  // A row nobody has heard from yet, as the table actually builds it -- not a
+  // hand-made `read: false` with `reachable: true`, which cannot occur:
+  // blankNode sets both false and Reading.apply sets both together.
+  const unread = Fleet.blankNode("192.0.2.10", "n", {})
+  assert.equal(unread.read, false)
+  assert.equal(unread.reachable, false)
+  assert.equal(runNodeRowDetail(unread), "")
+
+  const full = runNodeRowDetail(node({ model: "org/qwen3-35b", running: 2, waiting: 1, cache: 0.9 }))
+  assert.ok(/qwen3-35b/.test(full), "the model is not shown")
+  assert.ok(!/org\//.test(full), "the vendor prefix was not trimmed")
+  assert.ok(/2 running/.test(full), "in-flight requests are not shown")
+  assert.ok(/1 queued/.test(full), "the queue depth is not shown")
+  assert.ok(/90% cache/.test(full), "cache pressure is not shown")
+
+  // Shown only once they mean something: zeroes are noise, not information.
+  assert.equal(runNodeRowDetail(node({ model: "", running: 0, waiting: 0, cache: 0 })), "")
+})
+
+test("a failed probe of ours is not reported as a failed server", () => {
+  // Two paths learn NOTHING about the server: no slot in the pool, and a probe
+  // we killed for overrunning. Both used to record a reading, which produces
+  // "unreachable" -- the same word a powered-off box gets, for a fact about
+  // this widget rather than about that machine. Both now reset the row to the
+  // un-probed one, which reads "measuring" and clears on the next poll.
+  const svc = codeOf("Service.qml")
+  assert.ok(/function _forget\(host\)/.test(svc), "there is no way to un-know a host")
+  assert.ok(/if \(!proc\) \{ _forget\(host\); return \}/.test(svc),
+    "a host with no slot is recorded as a failed reading")
+  const kill = svc.slice(svc.indexOf("overran its deadline"))
+  assert.ok(/_forget\(host\)/.test(kill.slice(0, 400)),
+    "a probe we killed is recorded as the server failing")
+  assert.ok(!/_record\(host, null\)/.test(svc),
+    "something still fabricates a reading out of our own failure")
+
+  // And the row it leaves behind says so.
+  assert.equal(Fleet.stateLabel(Fleet.blankNode("192.0.2.10", "n", {})), "measuring")
+})
+
+test("the bar icon is wired to what the fleet actually reports", () => {
+  // Mutating `active: fleet.busy` to `active: true` -- a permanently lit icon
+  // claiming the fleet is always working -- passed the whole suite. These are
+  // one-line QML bindings, so there is no block to evaluate; the wiring itself
+  // is what gets asserted.
+  const panel = codeOf("Panel.qml")
+  for (const [binding, what] of [
+    ["active: fleet.busy", "lit only when something is generating"],
+    ["unknown: root.activityUnknown", "the third state"],
+    ["warning: !root.configured || root.nothingReachable", "the urgent badge"],
+  ]) {
+    const n = panel.split(binding).length - 1
+    assert.equal(n, 2, `${what}: expected both icons to bind it, found ${n}`)
+  }
+  // Both icons: the one in the bar and the one in the panel's header.
+  assert.equal(codeOf("Panel.qml").split("FleetIcon {").length - 1, 2)
+})
+
+test("every probe result reaches the row it was collected for", () => {
+  // Three mutations of this wiring passed the whole suite: discarding the
+  // collector's text (every server reads unreachable forever), never setting
+  // the slot's host (every result credited to ""), and an empty pool (no probe
+  // ever runs, every row reads measuring forever). None is reachable from JS.
+  const svc = codeOf("Service.qml")
+  assert.ok(/onExited: function \(exitCode\) \{/.test(svc), "the process reports no exit")
+  assert.ok(/root\._record\(host, collector\.text\)/.test(svc),
+    "the collected output never reaches the reading")
+  assert.ok(/proc\.host = host/.test(svc), "the slot is never told which host it is probing")
+  assert.ok(/model: root\.configuredHosts\(\)\.length/.test(svc),
+    "the probe pool is not sized to the configured servers")
+  // And the reading is what becomes the row.
+  assert.ok(/var res = Reading\.apply\(/.test(svc))
+  assert.ok(/_rows\[host\] = res\.node/.test(svc))
+
+  // Every delegate declares the index it uses. The implicit context-property
+  // form is deprecated, and one delegate was still relying on it.
+  for (const file of ["Service.qml", "FleetIcon.qml"]) {
+    const src = codeOf(file)
+    if (!/\bindex\b/.test(src)) continue
+    assert.ok(/required property int index/.test(src),
+      `${file} uses a delegate index it does not declare`)
+  }
 })

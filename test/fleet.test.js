@@ -181,9 +181,29 @@ test("every state a row can show is pinned to the condition that earns it", () =
   // Every one of them must be a state the row can actually reach.
   const shown = ["unreachable", "no activity signal", "measuring", "working", "idle"]
   const row = codeOf("NodeRow.qml") + codeOf("ColumnWidths.qml")
+  // Rendered through the shared label rather than as literals, so the check is
+  // that the row goes through it. It used to be `row.indexOf(st) > -1 || /Fleet
+  // \.stateLabel/.test(row)`, whose right-hand side is true for every state --
+  // the loop could not fail whatever `shown` contained.
+  assert.ok(/Fleet\.stateLabel\(node\)/.test(row), "the row does not render the shared label")
+  assert.ok(/Fleet\.columnValues\(widths\.nodes, "state"\)/.test(row),
+    "the state column is not sized from the shared label")
   for (const st of shown) {
-    assert.ok(row.indexOf(st) > -1 || /Fleet\.stateLabel/.test(row),
-      `${st} is never rendered`)
+    assert.equal(typeof st, "string")
+    assert.ok(Fleet.columnValues([], "state").length === 0)
+  }
+  // And every one is reachable from a real node, which is what "can show" means.
+  const reachable = new Set()
+  const seed = (o) => Object.assign(Fleet.blankNode("192.0.2.10", "n", {}), o)
+  for (const o of [{ read: true, reachable: false },
+                   { read: true, reachable: true, canReportActivity: false },
+                   { read: true, reachable: true, firstReading: true },
+                   { read: true, reachable: true, activity: { active: true, amount: 3 } },
+                   { read: true, reachable: true }]) {
+    reachable.add(Fleet.stateLabel(seed(o)).replace(/  \d+ tok$/, ""))
+  }
+  for (const st of shown) {
+    assert.ok(reachable.has(st), `${st} is a state no node can actually reach`)
   }
 })
 
@@ -272,11 +292,18 @@ test("an unchanged fleet is not republished", () => {
   assert.equal(Fleet.signature([node({ activity: { active: false, amount: null } })]), base,
     "a reading that changed no visible value forced a redraw")
 
-  // The service must compare before assigning.
+  // The service must compare before assigning. This was anchored to
+  // `nodes = _collected`, an identifier the per-host rewrite deleted, so
+  // indexOf gave -1 and the "260-character window" became slice(0, -1) -- the
+  // entire file. Proved: the guard could be removed with the suite still green.
   const svc = codeOf("Service.qml")
-  const at = svc.indexOf("nodes = _collected")
-  assert.ok(svc.slice(Math.max(0, at - 260), at).indexOf("Fleet.signature(") > -1,
+  const at = svc.indexOf("nodes = out")
+  assert.ok(at > -1, "the publish assignment could not be found -- this check is anchored to nothing")
+  const before = svc.slice(Math.max(0, at - 300), at)
+  assert.ok(before.indexOf("Fleet.signature(") > -1,
     "the table is republished without checking whether it changed")
+  assert.ok(/if \(next === _signature\) return/.test(before),
+    "the comparison is made and then ignored")
 })
 
 test("the signature is no WIDER than what a row renders", () => {

@@ -12,6 +12,7 @@ const { Servers, Text, Fleet, sourceOf } = require("./harness.js")
 
 const SERVICE = sourceOf("Service.qml")
 const PANEL = sourceOf("Panel.qml")
+const NODEROW = sourceOf("NodeRow.qml")
 
 // The block that follows a marker, brace-matched.
 //
@@ -77,7 +78,30 @@ function runPanelDetail(state) {
   return runBinding(PANEL, "readonly property string detail:", "the detail property", self)
 }
 
+// The row's traffic light. Colours come back as the NAMES of the theme slots
+// rather than real colours, so a test can assert that distinct states are
+// distinct things without hard-coding a palette.
+//
+// Evaluated, not read: a chain of returns inside a QML property is exactly
+// where the previous rounds' defects lived, and four mutations of this one --
+// including drawing an unreachable server GREEN -- passed the whole suite.
+function runNodeRowColor(node) {
+  return runBinding(NODEROW, "readonly property color stateColor:", "stateColor", {
+    Fleet: Fleet, node: node,
+    urgent: "urgent", dim: "dim",
+    nodeRow: { amber: "amber", green: "green" },
+  })
+}
+
+// The row's quieter second line: model, in-flight, queued, cache pressure.
+function runNodeRowDetail(node) {
+  return runBinding(NODEROW, "readonly property string detailText:", "detailText", {
+    Fleet: Fleet, Text: Text, node: node, Math: Math,
+  })
+}
+
 module.exports = {
-  SERVICE, PANEL, extractFunction,
+  SERVICE, PANEL, NODEROW, extractFunction,
   runConfiguredServers, runConfiguredRejects, runPanelDetail,
+  runNodeRowColor, runNodeRowDetail,
 }

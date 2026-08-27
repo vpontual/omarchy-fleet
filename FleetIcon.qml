@@ -46,6 +46,9 @@ Item {
   Repeater {
     model: 3
     delegate: Rectangle {
+      // Declared, not inherited from the delegate context: the implicit form is
+      // deprecated, and every other delegate in this plugin declares it.
+      required property int index
       x: root.inset
       y: root.inset + index * (root.unit + root.gap)
       width: root.span

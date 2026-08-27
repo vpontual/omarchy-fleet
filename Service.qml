@@ -195,9 +195,8 @@ Item {
   // declaratively by the Instantiator below.
   function _poll(host, index) {
     var proc = probePool.objectAt(index)
-    // No slot for this host at all: account for it rather than leaving the row
-    // silently un-updated.
-    if (!proc) { _record(host, null); return }
+    // No slot for this host at all: nothing was asked, so nothing is known.
+    if (!proc) { _forget(host); return }
 
     var action = Poll.pollAction(proc, Date.now())
     if (action === "skip") return
@@ -206,8 +205,12 @@ Item {
       // so reaching here means the process itself failed to exit.
       _log("killing a probe on " + proc.host + " that overran its deadline")
       proc.abandoned = true
+      // Setting running = false sends SIGTERM. It is `timeout --signal=KILL`
+      // inside the command that guarantees the process actually dies -- a child
+      // trapping TERM would otherwise stay running, `abandoned` would stay true,
+      // and pollAction would skip this host forever.
       proc.running = false
-      _record(host, null)
+      _forget(host)
       return
     }
 
@@ -242,13 +245,27 @@ Item {
 
   // ── Result assembly ─────────────────────────────────────────────────
 
+  // We learned nothing about this server: our own probe failed, or there was
+  // no slot to run it in. Reset the row to the un-probed one rather than
+  // recording a failed reading -- "unreachable" is a claim about the SERVER,
+  // and both of these are facts about us. The row reads "measuring", which is
+  // true, and the next poll clears it.
+  function _forget(host) {
+    _rows[host] = Fleet.blankNode(host, labelFor(host), _state[host])
+    probing = _anyRunning()
+    _publish()
+  }
+
   function _record(host, out) {
     // Everything a reading is allowed to claim is decided in Reading.js,
     // which is plain JS: its branches are executed by tests rather than
     // matched against QML source text.
     var res = Reading.apply(host, labelFor(host),
                             out, _state[host], Date.now())
+    // An absent state means "forget what was cached" -- which is what clears a
+    // runtime whose adapter no longer exists, so discovery can start over.
     if (res.state) _state[host] = res.state
+    else delete _state[host]
     _rows[host] = res.node
     probing = _anyRunning()
     _publish()

@@ -59,26 +59,41 @@ If you only use hosted APIs, this is not for you — there is nothing to watch.
 | Runtime | Detected by | Activity signal | Verified |
 |---|---|---|---|
 | vLLM | `vllm:` series on `/metrics` | generated-token counter, plus running/queued and KV cache | **live** |
-| Ollama | `/api/ps` | keep-alive expiry moving — see below | **live** |
+| Ollama | `/api/ps` | keep-alive expiry advancing — proves work happened, never that none is; see below | **live** |
 | llama.cpp | `llamacpp:` series on `/metrics` | predicted-token counter, plus processing/deferred | names |
 | SGLang | `sglang:` series on `/metrics` | generated-token counter, plus running/queued | names |
 | TGI | `tgi_` series on `/metrics` | generated-token histogram, batch and queue size | names |
 | OpenAI-compatible | `/v1/models` | none — reported as reachable only | n/a |
 
 **What "verified" means here, precisely.** *live* means I have run it against a
-real server of that kind and watched the activity signal move under load —
-vLLM and Ollama only. *names* means the series it reads are confirmed against
+real server of that kind and characterised its activity signal under load —
+vLLM and Ollama only. For vLLM that meant watching the counter move while it
+generated; for Ollama it meant discovering that its signal does **not** move
+while it generates, which is the paragraph below. *names* means the series it reads are confirmed against
 that project's own source (llama.cpp's metrics test asserts these exact names
 and types; SGLang's production-metrics reference; TGI's router source), and
 the adapter is tested against a body in that shape — **but no such server has
 ever been run against this plugin.** If you use one of those three, you are the
 first, and I would genuinely like to hear whether it worked.
 
-**Ollama has no token counter.** There is no `/metrics` endpoint to read, so
-there is nothing that counts work. What it does expose is each resident model's
-keep-alive expiry, which is pushed forward every time the model is used, so a
-*change* in that value means the model was touched between two polls. That is a
-coarser signal than a token count and the panel does not pretend otherwise.
+**Ollama has no token counter, and its signal only works in one direction.**
+There is no `/metrics` endpoint, so nothing counts work. What Ollama exposes is
+each resident model's keep-alive expiry — and it pushes that forward when a
+request **completes**, not while one is running. Measured across a 25-second
+generation: eight consecutive polls, all identical, advancing only once the
+generation had finished.
+
+So "the expiry did not move" is exactly what a *generating* server looks like,
+and it cannot be read as idle. An Ollama row therefore says `working` shortly
+after a generation finishes, and `no activity signal` the rest of the time —
+never a green `idle` it has not earned. With `keep_alive: -1` the expiry is a
+constant, so `no activity signal` is all it will ever say.
+
+The one thing `/api/ps` does prove is an **empty** model list: nothing resident
+cannot be generating, so that reads a true `idle`.
+
+If you want a real activity light on one machine, vLLM, llama.cpp `--metrics`,
+SGLang and TGI all publish a token counter and Ollama does not.
 
 **"llama.cpp shows nothing"** almost always means `llama-server` was started
 without `--metrics`. It serves no metrics endpoint unless asked to.
@@ -107,12 +122,21 @@ because an absence of evidence is not evidence of quiet. A server restart resets
 the token counter, and reading that negative delta as "no work" once drew a bold
 green `idle` over a node that was serving four requests.
 
+`idle` therefore means different things on different runtimes, and only on a
+runtime with a work counter does it mean "measured quiet". On Ollama it appears
+only when no model is resident at all.
+
 The last two are the same principle applied to failures, which were all one
 word until they were measured. A wedged engine and a powered-off box both time
 out; they are told apart by whether the TCP connection was accepted, which
 `curl` reports as a non-zero connect time. **That check runs once a server has
 been identified**, which is the steady state — a server that is wedged the very
 first time it is seen reads `unreachable` until it has answered once.
+
+Discovery has the same limit for a different reason: it only accepts a 2xx, so
+a server that has *never* been identified and answers only `401` is not found
+at all and reads `unreachable`. Once it has been identified, a non-2xx is
+correctly reported as reachable.
 
 ## Install
 
@@ -234,7 +258,7 @@ curl -sSf http://YOUR_SERVER:8000/metrics | head
 ## Development
 
 ```sh
-npm test                      # 108 tests, no dependencies
+npm test                      # 116 tests, no dependencies
 omarchy plugin validate .
 ```
 

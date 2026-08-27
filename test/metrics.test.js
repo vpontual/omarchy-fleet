@@ -231,6 +231,72 @@ test("Ollama with nothing loaded is idle, not unreadable", () => {
   assert.ok(!/;/.test(empty.token))
   const loaded = Metrics.readSample("ollama", OLLAMA_PS)
   assert.notEqual(loaded.token, empty.token, "a loaded model looks unloaded")
-  assert.ok(Metrics.activityBetween(empty, loaded).active,
-    "loading a model between two polls read as no activity")
+
+  // LOADING a model is not generating with it. This line used to assert the
+  // opposite -- it is the same defect as reading an eviction as work, and the
+  // test enshrined it.
+  assert.equal(Metrics.activityBetween(empty, loaded).active, false,
+    "a model appearing was reported as work")
+})
+
+test("Ollama's keep-alive can prove work happened, never that none is", () => {
+  // Measured against a live server across a 25-second generation: `expires_at`
+  // did not move once during it -- eight consecutive identical polls -- and
+  // advanced only after the generation FINISHED. Ollama sets it when the last
+  // reference is released. So "the expiry did not move" is precisely what a
+  // generating server looks like, and it was drawn bold green "idle".
+  const at = (name, expires) => ({ name: name, expires_at: expires, size_vram: 1 })
+  const ps = (models) => JSON.stringify({ models: models })
+  const sample = (models) => Metrics.readSample("ollama", ps(models))
+  const row = (before, now) =>
+    Fleet.stateLabel(readingOf("PORT 11434\nRT ollama\n" + ps(now), { sample: sample(before) }).node)
+
+  const T0 = "2026-08-27T13:54:07.815474896Z"
+  const T1 = "2026-08-27T13:54:41.095477389Z"
+
+  assert.equal(row([at("q", T0)], [at("q", T0)]), "no activity signal",
+    "a generating Ollama node was drawn idle")
+  assert.equal(row([at("q", T0)], [at("q", T1)]), "working",
+    "a completed generation was not reported")
+
+  // With keep_alive:-1 the expiry is a constant -- measured as a year 2318
+  // timestamp -- so an idle claim would have stood forever.
+  const FOREVER = "2318-12-07T13:27:49.871206114Z"
+  assert.equal(row([at("q", FOREVER)], [at("q", FOREVER)]), "no activity signal")
+
+  // But an EMPTY model list is conclusive: nothing loaded cannot be running.
+  // That is a real "idle", and it must survive the rule above.
+  assert.equal(row([], []), "idle", "a server with nothing resident lost a true answer")
+  assert.equal(row([at("q", T0)], []), "idle", "an evicted model is not still generating")
+
+  // A model appearing is not work either -- loaded is not used.
+  assert.equal(row([at("q", T0)], [at("q", T0), at("z", T1)]), "no activity signal",
+    "loading a second model was reported as generation")
+
+  // Ordering is by PARSED time, not by string. Ollama's fractional-second
+  // field varies in length, and a shorter fraction that is a numeric prefix of
+  // a longer one compares backwards: the terminating "Z" sorts above every
+  // digit, so ".79Z" reads as LATER than ".7994Z" while being 9ms earlier.
+  const earlier = "2026-08-27T13:54:07.79Z", later = "2026-08-27T13:54:07.7994Z"
+  assert.ok(!(earlier < later), "the premise of this check no longer holds")
+  assert.ok(Date.parse(earlier) < Date.parse(later), "these are not 9ms apart")
+  assert.equal(row([at("q", earlier)], [at("q", later)]), "working",
+    "an expiry that advanced was missed because the string sorted backwards")
+  assert.equal(row([at("q", later)], [at("q", earlier)]), "no activity signal",
+    "an expiry going backwards was read as work")
+
+  // An unorderable pair claims nothing, which can only withhold a "working".
+  assert.equal(row([at("q", "not-a-time")], [at("q", "also-not")]), "no activity signal")
+})
+
+test("a work counter still supports an idle claim", () => {
+  // The one-directional rule above must not leak onto the runtimes that DO
+  // count work: a vLLM counter that did not move is a measurement of quiet.
+  const before = Metrics.readSample("vllm", VLLM)
+  const after = Metrics.readSample("vllm", VLLM)
+  assert.equal(Metrics.activityBetween(before, after).active, false)
+  const node = readingOf("PORT 8000\nRT vllm\n" + VLLM, { sample: before }).node
+  assert.equal(Fleet.stateLabel(node), "idle",
+    "a counter that did not move stopped being evidence of quiet")
+  assert.notEqual(node.canReportActivity, false)
 })
