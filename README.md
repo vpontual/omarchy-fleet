@@ -223,23 +223,34 @@ curl -sSf http://YOUR_SERVER:8000/metrics | head
 ## Development
 
 ```sh
-npm test                      # 103 tests, no dependencies
+npm test                      # 104 tests, no dependencies
 omarchy plugin validate .
 ```
 
-Pure logic lives in plain JavaScript precisely so it is testable without a
-running shell:
+Pure logic lives in `lib/`, as plain JavaScript, precisely so it is testable
+without a running shell. QML stays at the top level and does nothing but draw.
 
 | file | job |
 |---|---|
-| `Model.js` | runtime adapters, Prometheus parsing, sampling, activity maths |
-| `Probe.js` | builds the probe command, reads what it prints back |
-| `Reading.js` | one probe result to one node record: what a row may claim |
+| `lib/Runtimes.js` | the adapter table: what each server type is detected by, and what it publishes |
+| `lib/Metrics.js` | Prometheus parsing, sampling, the activity delta |
+| `lib/Text.js` | everything rendered — stripped, clamped, shortened |
+| `lib/Servers.js` | the `servers` setting to a validated host list |
+| `lib/Fleet.js` | what a row, a fleet and the icon may **claim** |
+| `lib/Poll.js` | the polling decisions |
+| `lib/Probe.js` | builds the probe command, reads what it prints back |
+| `lib/Reading.js` | one probe result to one row |
 | `Service.qml` | the process pool, the poll timer, IPC |
-| `Panel.qml` | the panel and its headline copy |
+| `Panel.qml` | the panel |
 | `NodeRow.qml` | one server's row |
 | `ColumnWidths.qml` | measures each column once for the whole table |
 | `FleetIcon.qml` | the bar glyph |
+
+The `lib/` modules are QML JavaScript resources: each declares `.pragma
+library` and reaches its dependencies through `.import`, so there is one shared
+copy rather than one per QML file. `test/harness.js` resolves that same graph
+for `node --test`, and a test re-derives it from the sources to check that
+every module declares what it uses and nothing it does not.
 
 That split is not tidiness. Logic living in QML can only be reached by tests
 through a source extractor, and an assertion that reads source can pass against

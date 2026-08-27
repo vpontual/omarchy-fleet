@@ -2,9 +2,12 @@ import QtQuick
 import QtQml
 import Quickshell
 import Quickshell.Io
-import "Model.js" as Model
-import "Probe.js" as Probe
-import "Reading.js" as Reading
+import "lib/Fleet.js" as Fleet
+import "lib/Poll.js" as Poll
+import "lib/Probe.js" as Probe
+import "lib/Reading.js" as Reading
+import "lib/Servers.js" as Servers
+import "lib/Text.js" as Text
 
 // Fleet activity for the bar widget.
 //
@@ -30,7 +33,7 @@ Item {
   property var nodes: []
   property bool probing: false
 
-  readonly property var fleet: Model.fleetState(nodes)
+  readonly property var fleet: Fleet.fleetState(nodes)
   readonly property bool busy: fleet.busy
   // True only once every node has produced two readings, so the UI can say
   // "measuring" instead of asserting an idle fleet it has not yet observed.
@@ -38,7 +41,7 @@ Item {
   // Derived rather than assigned: it is a pure function of the rows, and as an
   // imperative flag the only place it could be recomputed was the publish
   // path -- so it was one more thing that had to be remembered there.
-  readonly property bool baselineReady: Model.baselineReady(nodes)
+  readonly property bool baselineReady: Fleet.baselineReady(nodes)
 
   readonly property int refreshIntervalSec: intSetting("refreshIntervalSec", 3, 1, 60)
   readonly property string serversSetting: stringSetting("servers", "")
@@ -72,12 +75,12 @@ Item {
   // This used to re-parse and re-regex the whole `servers` string on every
   // call, and it is called from a binding (`Instantiator.model`) and from
   readonly property var configured: {
-    var parsed = Model.parseServers(serversSetting)
+    var parsed = Servers.parseServers(serversSetting)
     var out = [], rejected = [], seen = {}
     for (var i = 0; i < parsed.length; i++) {
       var h = parsed[i].host.replace(/^https?:\/\//, "").replace(/\/.*$/, "")
       if (h === "") continue
-      if (!Model.isSafeHost(h)) { rejected.push(h); continue }
+      if (!Servers.isSafeHost(h)) { rejected.push(h); continue }
       // First mention wins. Two entries for one host share a single _state
       // key, so the second result of each cycle overwrote the first's sample
       // and the activity delta was measured against the wrong reading -- the
@@ -96,7 +99,7 @@ Item {
   readonly property string configError: configured.rejected.length === 0 ? ""
     : "Ignoring " + (configured.rejected.length === 1 ? "an unusable address: "
                                                       : configured.rejected.length + " unusable addresses: ")
-      + Model.clampField(configured.rejected.join(", "))
+      + Text.clampField(configured.rejected.join(", "))
 
   function configuredHosts() {
     var servers = configuredServers()
@@ -122,7 +125,7 @@ Item {
     var out = []
     for (var i = 0; i < nodes.length; i++) {
       var n = nodes[i]
-      out.push(Model.nodeSummary(n))
+      out.push(Fleet.nodeSummary(n))
     }
     return JSON.stringify({
       plugin: "veepee.fleet",
@@ -179,8 +182,8 @@ Item {
     }
 
     var hosts = configuredHosts()
-    _state = Model.pruneToConfigured(_state, hosts)
-    _rows = Model.pruneToConfigured(_rows, hosts)
+    _state = Poll.pruneToConfigured(_state, hosts)
+    _rows = Poll.pruneToConfigured(_rows, hosts)
 
     for (var i = 0; i < servers.length; i++) _poll(servers[i].host, i)
     probing = _anyRunning()
@@ -196,7 +199,7 @@ Item {
     // silently un-updated.
     if (!proc) { _record(host, null); return }
 
-    var action = Model.pollAction(proc, Date.now())
+    var action = Poll.pollAction(proc, Date.now())
     if (action === "skip") return
     if (action === "kill") {
       // `timeout --signal=KILL` inside the command bounds every normal case,
@@ -213,7 +216,7 @@ Item {
     // it: a discovery sweep can spend five times what a known-node read can,
     // and the two disagreed badly enough that no host was discoverable unless
     // it answered on the first candidate port.
-    var budget = Probe.budgetSec(Model, host, known)
+    var budget = Probe.budgetSec(host, known)
     proc.host = host
     proc.deadlineMs = Date.now() + (budget + 2) * 1000
     // `timeout` wraps BASH, not curl: GNU timeout runs its command in its own
@@ -225,7 +228,7 @@ Item {
     // intend to start.
     proc.command = ["/usr/bin/env", "-u", "BASH_ENV", "-u", "ENV",
                     "/usr/bin/timeout", "--signal=KILL", String(budget),
-                    "/usr/bin/bash", "-c", Probe.script(Model, host, known)]
+                    "/usr/bin/bash", "-c", Probe.script(host, known)]
     proc.running = true
   }
 
@@ -243,7 +246,7 @@ Item {
     // Everything a reading is allowed to claim is decided in Reading.js,
     // which is plain JS: its branches are executed by tests rather than
     // matched against QML source text.
-    var res = Reading.apply(Model, Probe, host, labelFor(host),
+    var res = Reading.apply(host, labelFor(host),
                             out, _state[host], Date.now())
     if (res.state) _state[host] = res.state
     _rows[host] = res.node
@@ -253,13 +256,13 @@ Item {
 
   // Assemble the table from whatever each host has last said.
   function _publish() {
-    var out = Model.tableRows(configuredServers(), _rows, _state)
+    var out = Poll.tableRows(configuredServers(), _rows, _state)
     // Assigning a fresh array re-runs every binding downstream, and a JS
     // array model has no diffing -- so every NodeRow (a CursorSurface and
     // five Texts) is destroyed and rebuilt, twenty times a minute, in the
     // process that draws the whole desktop. A quiet fleet produces the same
     // rows over and over, so most polls have nothing to publish.
-    var next = Model.signature(out)
+    var next = Fleet.signature(out)
     if (next === _signature) return
     _signature = next
     nodes = out

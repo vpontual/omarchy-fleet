@@ -1,6 +1,6 @@
 import QtQuick
 import qs.Commons
-import "Model.js" as Model
+import "lib/Fleet.js" as Fleet
 
 // How wide each column has to be, measured once for the whole table.
 //
@@ -79,16 +79,16 @@ QtObject {
   }
 
   function _measure() {
-    widths.label = _widest(Model.columnValues(widths.nodes, "label"))
-    widths.host = _widest(Model.columnValues(widths.nodes, "host"))
-    widths.runtime = _widest(Model.columnValues(widths.nodes, "runtime"))
+    widths.label = _widest(Fleet.columnValues(widths.nodes, "label"))
+    widths.host = _widest(Fleet.columnValues(widths.nodes, "host"))
+    widths.runtime = _widest(Fleet.columnValues(widths.nodes, "runtime"))
     // Sized for the widest state this column can REACH, not the widest it
     // happens to be showing. Sizing to the current values made the panel jump
     // wider the moment a server started working -- and clip the word it grew
     // for, when the new width hit the cap. A representative worst case keeps
     // the width stable and always fitting.
     widths.state = _widest(
-      Model.columnValues(widths.nodes, "state").concat(["working  9999 tok"]), true)
+      Fleet.columnValues(widths.nodes, "state").concat(["working  9999 tok"]), true)
   }
 
   property TextMetrics metrics: TextMetrics {

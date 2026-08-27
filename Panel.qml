@@ -3,7 +3,7 @@ import QtQuick.Controls
 import Quickshell.Io
 import qs.Commons
 import qs.Ui
-import "Model.js" as Model
+import "lib/Fleet.js" as Fleet
 
 // Bar widget and popup for the LLM fleet activity light.
 //
@@ -36,20 +36,20 @@ Panel {
   readonly property color hoverFill: bar ? Style.hoverFillFor(bar.foreground, Color.accent, bar.urgent) : "transparent"
 
   readonly property bool configured: fleet.configuredHosts().length > 0
-  // Both live in Model.js, executed by tests. This one was `up === 0`, which
+  // Both live in lib/Fleet.js, executed by tests. This one was `up === 0`, which
   // is also true of a fleet nobody has asked yet -- so the panel announced
   // "No servers reachable" over servers still being probed, one of which was
   // answering in milliseconds.
-  readonly property bool nothingReachable: Model.nothingReachable(fleet.fleet, configured)
+  readonly property bool nothingReachable: Fleet.nothingReachable(fleet.fleet, configured)
   readonly property bool activityUnknown:
-    Model.activityUnknown(fleet.fleet, configured, fleet.baselineReady)
+    Fleet.activityUnknown(fleet.fleet, configured, fleet.baselineReady)
 
   // Deliberately says "Measuring" until every node has produced two readings:
   // activity is a counter delta, so before that the widget has not observed an
-  // idle fleet, it has observed nothing at all. One definition, in Model.js,
+  // idle fleet, it has observed nothing at all. One definition, in lib/Fleet.js,
   // for the same reason stateLabel lives there.
   readonly property string headline:
-    Model.headline(fleet.fleet, configured, fleet.baselineReady)
+    Fleet.headline(fleet.fleet, configured, fleet.baselineReady)
 
   readonly property string detail: {
     // A rejected address comes FIRST: a typo used to drop the server silently,

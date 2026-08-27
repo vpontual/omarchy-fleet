@@ -1,7 +1,9 @@
 import QtQuick
 import qs.Commons
 import qs.Ui
-import "Model.js" as Model
+import "lib/Fleet.js" as Fleet
+import "lib/Runtimes.js" as Runtimes
+import "lib/Text.js" as Text
 
 // One server's row: nickname, address, runtime, state, and a quieter line
 // saying what it is running.
@@ -35,12 +37,12 @@ CursorSurface {
 
   readonly property string runtimeLabel: {
     if (!node || !node.runtime) return ""
-    var rt = Model.runtimeOf(node.runtime)
+    var rt = Runtimes.runtimeOf(node.runtime)
     return rt ? rt.label : node.runtime
   }
   // One definition, used by the row AND by the column measurement above --
   // two copies would drift and the column would size to the wrong string.
-  readonly property string stateText: Model.stateLabel(node)
+  readonly property string stateText: Fleet.stateLabel(node)
   // A traffic light, because the state is the thing you glance at.
   //
   // Green and amber are fixed rather than theme-derived: the shell's
@@ -49,7 +51,7 @@ CursorSurface {
   // not -- accent is blue in some themes and would read as "information".
   // Red stays urgent, which IS the theme's own alert colour, so the one
   // state that means "something is wrong" matches the rest of the bar.
-  // The ladder itself is in Model.js and executed by tests: as a chain of
+  // The ladder itself is in lib/Fleet.js and executed by tests: as a chain of
   // ternaries here, four separate mutations of it -- drawing an unreachable
   // node GREEN among them -- left the whole suite passing.
   //
@@ -57,7 +59,7 @@ CursorSurface {
   // "I cannot tell yet" the same colour at a glance, which is the one
   // distinction this widget exists to draw.
   readonly property color stateColor: {
-    var tone = Model.stateTone(node)
+    var tone = Fleet.stateTone(node)
     if (tone === "down") return urgent
     if (tone === "unknown") return dim
     if (tone === "working") return nodeRow.amber
@@ -72,7 +74,7 @@ CursorSurface {
   readonly property string detailText: {
     if (!node || !node.reachable) return ""
     var bits = []
-    var model = Model.shortModelName(node.model || "")
+    var model = Text.shortModelName(node.model || "")
     if (model !== "") bits.push(model)
     // Collected, summed across engines, carried in the row signature -- and
     // never once rendered, while the README advertised it. A row that changed
@@ -164,7 +166,7 @@ CursorSurface {
 
   Text {
     // Server-controlled: the model id is whatever the operator named it, so
-    // it is stripped and clamped in Model.js and rendered as plain text.
+    // it is stripped and clamped in lib/Text.js and rendered as plain text.
     textFormat: Text.PlainText
     id: detailLine
     anchors.left: nameText.left
