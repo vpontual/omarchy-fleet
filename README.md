@@ -123,8 +123,10 @@ small `bash` wrapper, reads the response and displays numbers from it. That is
 the whole of it.
 
 Once a server has been identified that is **one** request — `/metrics` for the
-metrics-bearing runtimes, `/api/ps` for Ollama. Until then it is a discovery
-sweep, and that is up to **fifteen**: five candidate ports
+metrics-bearing runtimes, `/api/ps` for Ollama — and a second only when the
+first came back empty, to tell a server that published nothing readable apart
+from one that did not answer at all. Until then it is a discovery sweep, and
+that is up to **fifteen**: five candidate ports
 (`8000`, `11434`, `8080`, `30000`, `1234`) times three endpoints. Giving an
 explicit `host:port` skips the sweep entirely, and so does a server that
 answers, because the port is remembered.
@@ -180,7 +182,7 @@ curl -sSf http://YOUR_SERVER:8000/metrics | head
 ## Development
 
 ```sh
-npm test                      # 84 tests, no dependencies
+npm test                      # 87 tests, no dependencies
 omarchy plugin validate .
 ```
 
@@ -191,6 +193,7 @@ running shell:
 |---|---|
 | `Model.js` | runtime adapters, Prometheus parsing, sampling, activity maths |
 | `Probe.js` | builds the probe command, reads what it prints back |
+| `Reading.js` | one probe result to one node record: what a row may claim |
 | `Service.qml` | process pool, timers, cycle bookkeeping, IPC |
 | `Panel.qml` | the panel and its headline copy |
 | `NodeRow.qml` | one server's row |

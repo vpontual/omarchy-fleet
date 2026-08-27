@@ -37,8 +37,16 @@ function script(Model, host, known) {
 
   if (known && known.port) {
     var rt = Model.runtimeOf(known.runtime)
+    // A cached runtime that is no longer in the table. Latent -- markers come
+    // from our own echo -- but the blast radius is the wedge this file already
+    // documents: the throw escapes refresh() after probing is set, no process
+    // starts, and every later refresh returns early. Forever.
+    if (!rt) return ""
     var url = "http://" + addr.host + ":" + known.port + rt.probe
-    var cmd = curl + " " + url
+    // 2>/dev/null like every other curl here: -sS keeps error text for a human
+    // and $(...) captures stdout only, so without this it escapes to the
+    // shell's stderr, which nothing collects and nobody reads.
+    var cmd = curl + " " + url + " 2>/dev/null"
     if (rt.filter) cmd += " | grep -E '" + rt.filter + "'"
     // The steady-state path, and it was the UNBOUNDED one: discovery capped
     // its body while this, which runs on every poll once a node is known,
@@ -145,9 +153,11 @@ function parse(Model, text, maxBytes) {
     var n = parseInt(portMatch[1], 10)
     if (n >= 1 && n <= 65535) port = n
   }
-  // Answered, but published nothing this adapter can read. Distinct from a
-  // sample and distinct from silence -- collapsing it into either is how a
-  // saturated node gets drawn as quiet.
-  var sampleless = /^NOSAMPLE$/m.test(clipped)
-  return { runtime: runtime, port: port, body: body, sampleless: sampleless }
+  // No sampleless flag: the caller decides by whether a sample could be READ,
+  // which covers this case and the ones a marker cannot see -- a body that
+  // merely prefix-matches the filter, or a cached port now serving something
+  // else. The marker itself stays because it is what makes the text non-empty
+  // on that branch, and so the difference between "alive but quiet" and "did
+  // not answer at all".
+  return { runtime: runtime, port: port, body: body }
 }

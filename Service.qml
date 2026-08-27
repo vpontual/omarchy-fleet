@@ -5,6 +5,7 @@ import Quickshell.Io
 import qs.Commons
 import "Model.js" as Model
 import "Probe.js" as Probe
+import "Reading.js" as Reading
 
 // Fleet activity for the bar widget.
 //
@@ -175,6 +176,19 @@ Item {
     var proc = probePool.objectAt(index)
     if (!proc) { _finish(host, null); return }
 
+    // A straggler the watchdog abandoned may still be alive on this slot. The
+    // fence stamps the process, not the result, so re-stamping it would credit
+    // its stale output to THIS cycle -- and `running = true` on an already
+    // running Process does nothing, so the host would be silently skipped.
+    // Kill it (its exit lands under the old id and is discarded) and report
+    // the host as unreachable for this cycle rather than inventing a reading.
+    if (proc.running) {
+      _log("killing a straggler on " + proc.host + " from cycle " + proc.cycle)
+      proc.running = false
+      _finish(host, null, cycle)
+      return
+    }
+
     proc.host = host
     proc.cycle = cycle
     // `timeout` wraps BASH, not curl: GNU timeout runs its command in its own
@@ -207,69 +221,13 @@ Item {
       _log("discarding a late result for " + host + " from cycle " + cycle)
       return
     }
-    var now = Date.now()
-    var prev = _state[host] || {}
-    var node = Model.blankNode(host, labelFor(host), prev)
-
-    // The clamp is a second line of defence only -- the real bound is in the
-    // probe script -- and the parsing lives in Probe.js so it can be tested
-    // against hostile bodies without a running shell.
-    var read = Probe.parse(Model, out, Model.MAX_PROBE_BYTES)
-    if (read) {
-      var runtime = read.runtime
-      var body = read.body
-      {
-        node.reachable = true
-        node.runtime = runtime
-        node.port = read.port !== null ? read.port : prev.port
-        var rt = Model.runtimeOf(runtime)
-        node.canReportActivity = !(rt && rt.noActivity)
-        var sample = Model.readSample(runtime, body)
-
-        // Answered, but published nothing readable. "idle" would be a claim
-        // about work; this is an absence of evidence, and the two must not
-        // look the same.
-        //
-        // Applied only when there is genuinely no sample. The marker is our
-        // own, but the parser sees it anywhere in the text, and one runtime
-        // (ollama) has no filter -- so a body could in principle carry the
-        // word. A real reading always wins over a marker.
-        if (read.sampleless && !sample) node.canReportActivity = false
-        if (sample) {
-          node.running = sample.running
-          node.waiting = sample.waiting
-          node.cache = sample.cache
-          node.model = sample.model
-          // No activity signal AT ALL -- neither a work counter nor Ollama's
-          // keep-alive token. `work === null` alone is not that test: Ollama
-          // legitimately has no counter and signals through `token`, so
-          // checking only `work` marked every healthy Ollama node as unable to
-          // report activity. Caught by looking at a real one.
-          if (sample.work === null && !sample.token) node.canReportActivity = false
-          else if (prev.sample) node.activity = Model.activityBetween(prev.sample, sample)
-          else node.firstReading = true
-        }
-
-        // Cache what was DETECTED, whether or not a sample parsed.
-        //
-        // Caching only on a successful sample meant a node that answered but
-        // yielded nothing usable was never remembered, so the full sweep --
-        // five ports times three endpoints -- re-ran on every refresh. At the
-        // default interval that is five requests a second against that host,
-        // indefinitely, while the panel showed it reachable and idle. A server
-        // triggers it by emitting `vllm:` without a token counter, which is
-        // also what an ordinary version skew produces.
-        _state[host] = { host: host, port: node.port, runtime: runtime,
-                         sample: sample || null, lastSeenMs: now }
-      }
-    }
-
-    if (!node.reachable && prev.runtime) {
-      // Keep what we learned so a blip does not force rediscovery, but do not
-      // carry the old sample forward -- a stale counter would fabricate a
-      // delta the moment the node returns.
-      _state[host] = { host: host, port: prev.port, runtime: prev.runtime, sample: null, lastSeenMs: prev.lastSeenMs }
-    }
+    // Everything a reading is allowed to claim is decided in Reading.js,
+    // which is plain JS: its branches are executed by tests rather than
+    // matched against QML source text.
+    var res = Reading.apply(Model, Probe, host, labelFor(host),
+                            out, _state[host], Date.now())
+    if (res.state) _state[host] = res.state
+    var node = res.node
 
     _collected.push(node)
     _pending--

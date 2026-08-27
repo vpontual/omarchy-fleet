@@ -133,7 +133,8 @@ var PORT_CANDIDATES = (function () {
 
 // Identify a runtime from a /metrics body by its series prefix. This is what
 // lets the user enter an IP and nothing else: the prefix is unambiguous, and
-// was confirmed against live vLLM and Ollama nodes.
+// was confirmed against live vLLM and Ollama nodes. Aphrodite is a vLLM fork
+// emitting the same `vllm:` series, so it lands on vllm and needs no adapter.
 function detectFromMetrics(body) {
   var text = String(body || "")
   for (var key in RUNTIMES) {
@@ -147,9 +148,8 @@ function detectFromMetrics(body) {
   return null
 }
 
-// Aphrodite is a vLLM fork and emits the same `vllm:` series, so it is
-// identified as vllm and needs no adapter of its own.
-
+// Look up an adapter by name, or null. Every caller must handle null: the name
+// can come from a cached entry written by an older version of this file.
 function runtimeOf(name) {
   return RUNTIMES[String(name || "").toLowerCase()] || null
 }
@@ -213,8 +213,6 @@ function sumMetric(text, metric) {
   return total
 }
 
-// ── Sampling ──────────────────────────────────────────────────────────
-
 // The MEAN of a series, for gauges rather than counters.
 //
 // sumMetric exists because vLLM emits one series per engine and per model, and
@@ -245,6 +243,8 @@ function avgMetric(text, metric) {
   for (var v = 0; v < values.length; v++) total += values[v]
   return total / values.length
 }
+
+// ── Sampling ──────────────────────────────────────────────────────────
 
 // One reading from one node. `work` is a monotonic counter where the runtime
 // has one, or a token derived from Ollama's keep-alive expiry where it does
@@ -340,7 +340,7 @@ function activityBetween(prev, curr) {
 // a node whose runtime has no counter must never be drawn as "quiet".
 function fleetState(nodes) {
   var up = 0, down = 0, active = 0, unknown = 0, tokens = 0, running = 0, waiting = 0
-  var anyTokens = false, anyRunning = false
+  var anyTokens = false, anyRunning = false, anyWaiting = false
 
   for (var i = 0; i < (nodes || []).length; i++) {
     var n = nodes[i]
@@ -350,7 +350,9 @@ function fleetState(nodes) {
     if (n.canReportActivity === false) unknown++
     if (n.activity && typeof n.activity.amount === "number") { tokens += n.activity.amount; anyTokens = true }
     if (typeof n.running === "number") { running += n.running; anyRunning = true }
-    if (typeof n.waiting === "number") { waiting += n.waiting }
+    // Its own flag: a runtime can publish a queue depth without a running
+    // gauge, and gating this on anyRunning reported null for it.
+    if (typeof n.waiting === "number") { waiting += n.waiting; anyWaiting = true }
   }
 
   return {
@@ -362,7 +364,7 @@ function fleetState(nodes) {
     busy: active > 0,
     tokens: anyTokens ? tokens : null,
     running: anyRunning ? running : null,
-    waiting: anyRunning ? waiting : null
+    waiting: anyWaiting ? waiting : null
   }
 }
 
@@ -399,6 +401,9 @@ function parseServers(raw) {
   return out
 }
 
+// How long a rendered string may be before it is cut. Everything here reaches
+// the bar's popup, and the bar belongs to the whole desktop -- a config error
+// listing thirty rejected entries should shorten, not reflow the panel.
 var MAX_MESSAGE = 160
 function clampField(value) {
   var text = stripControl(String(value || "")).trim()
@@ -448,9 +453,6 @@ function splitHostPort(spec) {
 // A host:port accepted into a shell command. Deliberately strict: this string
 // is interpolated into a curl invocation, so anything that could end the
 // argument or start another command must be impossible.
-// How long a nickname may be before it is cut. It is rendered in the bar's
-// popup, and the bar belongs to the whole desktop -- a pasted essay should
-// shorten, not reflow the panel.
 function isSafeHost(host) {
   return /^[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]{1,5})?$/.test(String(host || ""))
 }

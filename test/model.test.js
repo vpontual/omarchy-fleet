@@ -240,6 +240,17 @@ const Probe = new Function(
   "; return { script, parse }"
 )()
 
+// Reading.js is plain JS too, so the honesty rules load and RUN.
+const Reading = new Function(
+  fs.readFileSync(path.join(__dirname, "..", "Reading.js"), "utf8") +
+  "; return { apply }"
+)()
+
+// One probe result through the real assembler, as Service._finish calls it.
+function readingOf(out, prev, host) {
+  return Reading.apply(Model, Probe, host || "192.0.2.10", "node", out, prev, 1000)
+}
+
 function renderProbe(host, known) {
   // The REAL function, imported rather than scraped out of QML.
   return Probe.script(Model, host, known)
@@ -383,7 +394,12 @@ test("the collector read is clamped as well as the probe", () => {
   assert.equal(Probe.parse(Model, "PORT 8000\nRT vllm\n" + "x".repeat(200000),
     Model.MAX_PROBE_BYTES).body.length <= Model.MAX_PROBE_BYTES, true,
     "Probe.parse does not clamp what it is handed")
-  assert.ok(/Probe\.parse\(Model, out, Model\.MAX_PROBE_BYTES\)/.test(SERVICE),
+  // And the assembler Service hands the collector's text to uses that ceiling
+  // rather than one of its own -- executed, not read off the source.
+  const huge = "PORT 8000\nRT vllm\nvllm:generation_tokens_total 3\n" + "x".repeat(200000)
+  assert.ok(readingOf(huge, {}).node.reachable,
+    "an oversized body was dropped instead of clamped")
+  assert.ok(/Probe\.parse\(Model, out, Model\.MAX_PROBE_BYTES\)/.test(codeOf("Reading.js")),
     "the collector read does not go through the clamped parser")
 })
 
@@ -990,16 +1006,16 @@ test("a detected node is cached even when no sample could be parsed", () => {
   // nothing usable was never remembered, so the full sweep -- five ports times
   // three endpoints -- re-ran every refresh: five requests a second against
   // that host, indefinitely, while the panel showed it reachable and idle.
-  const finish = extractFunction("_finish")
-  const code = finish.split("\n").filter(l => !l.trim().startsWith("//")).join("\n")
-  const at = code.indexOf("_state[host] = {")
-  assert.notEqual(at, -1, "the cache write could not be found")
-  // The write must not sit behind a sample check.
-  const before = code.slice(Math.max(0, at - 200), at)
-  assert.ok(!/if \(sample\)[^\n]*$/.test(before.trim()),
-    "the cache write is conditional on a sample again")
-  assert.ok(/sample: sample \|\| null/.test(code),
-    "the cached entry does not tolerate a missing sample")
+  // Answered on 8000 as vLLM, published nothing this adapter can read.
+  const res = readingOf("PORT 8000\nRT vllm\nNOSAMPLE\n", {})
+  assert.ok(res.state, "a detected node was not cached, so the sweep re-runs")
+  assert.equal(res.state.runtime, "vllm", "the detected runtime was not kept")
+  assert.equal(res.state.port, 8000, "the detected port was not kept")
+  assert.equal(res.state.sample, null, "a missing sample was not tolerated")
+
+  // The next cycle then probes the known port instead of sweeping.
+  assert.ok(!/for p in/.test(Probe.script(Model, "192.0.2.10", res.state)),
+    "the cached entry did not stop the full port sweep")
 })
 
 // ── Every adapter, against a body in its documented shape ────────────
@@ -1121,7 +1137,7 @@ test("no QML file carries pure logic that belongs in JS", () => {
   // both of the worst defects found in review lived in exactly that region.
   const budgets = { "Service.qml": 340, "Panel.qml": 260, "NodeRow.qml": 200, "ColumnWidths.qml": 140 }
   for (const [file, max] of Object.entries(budgets)) {
-    const n = fs.readFileSync(path.join(__dirname, "..", file), "utf8").split("\n").length
+    const n = fs.readFileSync(path.join(__dirname, "..", file), "utf8").trimEnd().split("\n").length
     assert.ok(n <= max, `${file} is ${n} lines, over its ${max}-line budget — split it`)
   }
 })
@@ -1281,20 +1297,39 @@ test("the markers are never emitted before something answers", () => {
 test("answered-but-unreadable is distinct from both a sample and silence", () => {
   // Collapsing it into "idle" is how a saturated node gets drawn as quiet;
   // collapsing it into "down" hides a server that is plainly alive.
-  const withSample = Probe.parse(Model, "PORT 8000\nRT vllm\nvllm:x 1\n", 9999)
-  assert.equal(withSample.sampleless, false)
+  // Three bodies, all reachable, none readable -- the marker only sees the
+  // first, which is why the rule downstream is the sample and not the marker.
+  const unreadable = [
+    "PORT 8000\nRT vllm\nNOSAMPLE\n",              // published nothing
+    "PORT 8000\nRT vllm\nvllm:x_created 1\n",      // prefix-matched the filter
+    "PORT 11434\nRT ollama\n<html>nope</html>\n",  // port now serves something else
+  ]
+  for (const text of unreadable) {
+    const read = Probe.parse(Model, text, 9999)
+    assert.ok(read, `a live server parsed as silence: ${text}`)
+    assert.ok(!/NOSAMPLE/.test(read.body), "the marker leaked into the body")
+    assert.equal(Model.readSample(read.runtime, read.body), null,
+      `an unreadable body produced a sample: ${text}`)
+  }
 
-  const answered = Probe.parse(Model, "PORT 8000\nRT vllm\nNOSAMPLE\n", 9999)
-  assert.equal(answered.sampleless, true, "NOSAMPLE was not recognised")
-  assert.ok(!/NOSAMPLE/.test(answered.body), "the marker leaked into the body")
+  // A readable one still reads, or the check above proves nothing.
+  const withSample = Probe.parse(Model, "PORT 8000\nRT vllm\nvllm:generation_tokens_total 5\n", 9999)
+  assert.ok(Model.readSample(withSample.runtime, withSample.body), "a real sample stopped reading")
 
   assert.equal(Probe.parse(Model, "", 9999), null)
 
-  // And the service must turn that into an honest label, not "idle".
-  const svc = codeOf("Service.qml")
-  assert.ok(/read\.sampleless/.test(svc), "Service ignores sampleless")
-  assert.ok(/read\.sampleless && !sample\) node\.canReportActivity = false/.test(svc.replace(/\s+/g, " ")),
-    "a sampleless node is not marked as unable to report activity")
+  // And the assembler must turn a null sample into an honest label, not
+  // "idle". The rule is the SAMPLE, not the marker: NOSAMPLE only fires on an
+  // empty body, so keying off it left a node answering with a non-empty but
+  // unreadable body falling through every branch and drawn green.
+  for (const text of unreadable) {
+    const res = readingOf(text, {})
+    assert.equal(res.node.reachable, true, `a live server was drawn as down: ${text}`)
+    assert.equal(res.node.canReportActivity, false,
+      `an unreadable body was drawn as idle: ${text}`)
+    assert.equal(Model.stateLabel(res.node), "no activity signal",
+      `the row does not say so: ${text}`)
+  }
 })
 
 test("a partial exporter keeps the numbers it did publish", () => {
@@ -1317,6 +1352,74 @@ test("a partial exporter keeps the numbers it did publish", () => {
   // And a node that cannot report activity does not claim to be idle.
   assert.equal(Model.stateLabel({ reachable: true, canReportActivity: false }),
     "no activity signal")
+})
+
+test("an error page is not a reading", () => {
+  // curl -f. Without it a 500 whose body happens to contain a kept series --
+  // an nginx error page from a proxy in front of a dead engine, say -- is
+  // captured and drawn as a healthy sample.
+  const cp = require("node:child_process")
+  const os = require("node:os")
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-curlf-"))
+  try {
+    fs.writeFileSync(path.join(dir, "curl"),
+      '#!/bin/bash\n' +
+      // Behave like the real thing: with -f, fail on a 5xx and print nothing.
+      // The flag arrives inside a cluster (-sSf), not on its own.
+      'for a in "$@"; do case "$a" in -[!-]*f*|--fail) exit 22;; esac; done\n' +
+      'printf "vllm:generation_tokens_total 5\\n"\n')
+    fs.chmodSync(path.join(dir, "curl"), 0o755)
+
+    const run = (known) => cp.spawnSync("/usr/bin/bash",
+      ["-c", renderProbe("192.0.2.10:8000", known)],
+      { env: { ...process.env, PATH: dir + ":" + process.env.PATH },
+        encoding: "utf8", timeout: 20000 }).stdout || ""
+
+    assert.equal(run({ port: 8000, runtime: "vllm" }).trim(), "",
+      "a failed request was reported as a reading")
+    assert.equal(run(null).trim(), "",
+      "discovery accepted a failed request as an answer")
+    assert.equal(Probe.parse(Model, run({ port: 8000, runtime: "vllm" }), 9999), null)
+  } finally { fs.rmSync(dir, { recursive: true, force: true }) }
+})
+
+test("an outage drops the sample but keeps what was learned", () => {
+  // Carrying the old sample forward would fabricate a delta against a counter
+  // read minutes ago the moment the node returns -- a box that was down
+  // reappearing as "working 40k tok". Dropping the runtime instead would force
+  // the whole five-port sweep after every blip.
+  const prev = { host: "192.0.2.10", port: 8000, runtime: "vllm",
+                 sample: { work: 100, at: 1 }, lastSeenMs: 5 }
+  const res = readingOf(null, prev)
+
+  assert.equal(res.node.reachable, false)
+  assert.ok(res.state, "an outage forgot a known node, forcing rediscovery")
+  assert.equal(res.state.runtime, "vllm", "the known runtime was dropped")
+  assert.equal(res.state.port, 8000, "the known port was dropped")
+  assert.strictEqual(res.state.sample, null, "a stale sample survived an outage")
+  assert.equal(res.state.lastSeenMs, 5, "an outage was recorded as a sighting")
+
+  // And the node that comes back measures rather than claiming a delta.
+  const back = readingOf("PORT 8000\nRT vllm\nvllm:generation_tokens_total 900\n", res.state)
+  assert.equal(back.node.firstReading, true, "a delta was fabricated across an outage")
+  assert.equal(back.node.activity.active, false)
+})
+
+test("a straggler never has this cycle's id stamped onto it", () => {
+  // The watchdog resets `probing` without killing the processes, so the next
+  // cycle can reach a slot that is still running. Re-stamping it hands the
+  // fence the wrong answer: the stale exit is accepted as this cycle's result,
+  // and the host is never actually probed, because setting `running = true` on
+  // a running Process does nothing.
+  const svc = codeOf("Service.qml")
+  const fn = svc.slice(svc.indexOf("function probeHost"), svc.indexOf("function _bounded") + 1 || undefined)
+  const guard = fn.indexOf("if (proc.running)")
+  assert.ok(guard > -1, "probeHost reuses a slot without checking whether it is busy")
+  assert.ok(guard < fn.indexOf("proc.cycle = cycle"),
+    "the busy check runs after the cycle id has already been stamped")
+  assert.ok(/proc\.running = false/.test(fn), "the straggler is left running")
+  assert.ok(/_finish\(host, null, cycle\)/.test(fn),
+    "the skipped host is not accounted for, so _pending never reaches zero")
 })
 
 test("the poll watchdog is a deadline for the cycle, not a clock", () => {
@@ -1359,7 +1462,13 @@ test("the node record has one definition", () => {
   assert.equal(n.reachable, false, "a fresh record must not claim reachability")
   assert.equal(n.canReportActivity, true)
   assert.deepEqual(n.activity, { active: false, amount: null })
-  for (const f of ["running", "waiting", "cache", "loaded"]) assert.equal(n[f], null, f)
+  // assert.equal is loose, so a field name that no longer exists compares
+  // undefined == null and passes vacuously -- "loaded" sat here doing that.
+  for (const f of ["running", "waiting", "cache"]) {
+    assert.ok(f in n, `blankNode no longer carries ${f}`)
+    assert.strictEqual(n[f], null, f)
+  }
+  assert.equal("loaded" in n, false, "an unread field crept back into the record")
   assert.equal(n.model, "")
   // With no history it carries nothing.
   const fresh = Model.blankNode("h", "", null)
@@ -1379,9 +1488,10 @@ test("Ollama's keep-alive signal is not mistaken for no signal at all", () => {
   assert.equal(s.work, null, "ollama has no work counter")
   assert.ok(s.token, "ollama must still carry its keep-alive token")
 
-  const svc = codeOf("Service.qml").replace(/\s+/g, " ")
-  assert.ok(/work === null && !sample\.token/.test(svc),
-    "the no-signal test looks at work alone, which is true for healthy Ollama")
+  // And the assembler must not read that as "no signal at all".
+  const first = readingOf("PORT 11434\nRT ollama\n" + body, {})
+  assert.notEqual(first.node.canReportActivity, false,
+    "a healthy ollama node was marked unable to report activity")
 
   // Two readings with a moved expiry are activity.
   const later = Model.readSample("ollama", JSON.stringify({ models: [
@@ -1440,8 +1550,9 @@ test("a server that answers but publishes nothing readable emits NOSAMPLE", () =
     assert.ok(/^NOSAMPLE$/m.test(out), `alive-but-unreadable did not emit NOSAMPLE: ${JSON.stringify(out)}`)
     const read = Probe.parse(Model, out, Model.MAX_PROBE_BYTES)
     assert.ok(read, "NOSAMPLE did not parse as a reading")
-    assert.equal(read.sampleless, true)
     assert.equal(read.runtime, "vllm")
+    assert.equal(Model.readSample(read.runtime, read.body), null,
+      "an empty body produced a sample")
 
     // And a server that is actually down still emits nothing at all.
     fs.writeFileSync(path.join(dir, "curl"), "#!/bin/bash\nexit 7\n")
@@ -1474,11 +1585,9 @@ test("a real sample beats a NOSAMPLE marker in the same body", () => {
   // The marker is ours, but parse sees it anywhere in the text and one runtime
   // (ollama) has no filter, so a body could in principle carry the word. It
   // must never demote a node that plainly published a reading.
-  const svc = codeOf("Service.qml").replace(/\s+/g, " ")
-  assert.ok(/read\.sampleless && !sample/.test(svc),
-    "sampleless is applied without checking whether a sample was obtained")
-  // And it must be evaluated after the sample is read, not before.
-  const code = codeOf("Service.qml")
-  assert.ok(code.indexOf("Model.readSample(runtime, body)") < code.indexOf("read.sampleless"),
-    "sampleless is decided before the sample is even read")
+  const forged = "PORT 8000\nRT vllm\nNOSAMPLE\nvllm:generation_tokens_total 7\n"
+  const res = readingOf(forged, { sample: { work: 1, at: 0 } })
+  assert.notEqual(res.node.canReportActivity, false,
+    "a forged marker demoted a node that published a real reading")
+  assert.equal(res.state.sample.work, 7, "the real reading was discarded")
 })
